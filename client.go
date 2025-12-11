@@ -1323,6 +1323,10 @@ func (client *client) MetadataSnapshot() *MetadataSnapshot {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
 
+	if client.updateMetadataMs.Load() == 0 {
+		return nil
+	}
+
 	snapshot := &MetadataSnapshot{
 		UpdatedAt: time.UnixMilli(client.updateMetadataMs.Load()),
 		Brokers:   make(map[int32]string, len(client.brokers)),

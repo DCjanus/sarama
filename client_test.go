@@ -1426,3 +1426,31 @@ func TestMetadataSnapshotCopyAndNoRefresh(t *testing.T) {
 	require.Equal(t, "addr1", client.brokers[1].Addr())
 	require.Equal(t, int32(1), client.metadata["foo"][0].Leader)
 }
+
+func TestMetadataSnapshotNilWhenEmpty(t *testing.T) {
+	client := &client{
+		conf:     NewConfig(),
+		brokers:  map[int32]*Broker{},
+		metadata: make(map[string]map[int32]*PartitionMetadata),
+	}
+	client.lock = sync.RWMutex{}
+	client.updateMetadataMs.Store(0)
+
+	require.Nil(t, client.MetadataSnapshot())
+}
+
+func TestMetadataSnapshotEmptyClusterButRefreshed(t *testing.T) {
+	client := &client{
+		conf:     NewConfig(),
+		brokers:  map[int32]*Broker{},
+		metadata: make(map[string]map[int32]*PartitionMetadata),
+	}
+	client.lock = sync.RWMutex{}
+	client.updateMetadataMs.Store(time.Now().UnixMilli())
+
+	snap := client.MetadataSnapshot()
+	require.NotNil(t, snap)
+	require.Empty(t, snap.Topics)
+	require.Empty(t, snap.Brokers)
+	require.False(t, snap.UpdatedAt.IsZero())
+}
