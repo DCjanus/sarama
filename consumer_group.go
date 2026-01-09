@@ -142,7 +142,7 @@ func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 		errors:         make(chan error, config.ChannelBufferSize),
 		closed:         make(chan none),
 		userData:       config.Consumer.Group.Member.UserData,
-		metricRegistry: newCleanupRegistry(config.MetricRegistry),
+		metricRegistry: newCleanupRegistry(config.metricRegistry()),
 	}
 	if config.Consumer.Group.InstanceId != "" && config.Version.IsAtLeast(V2_3_0_0) {
 		cg.groupInstanceId = &config.Consumer.Group.InstanceId
