@@ -10,6 +10,8 @@ import (
 
 	"github.com/klauspost/compress/gzip"
 	"github.com/rcrowley/go-metrics"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/net/proxy"
 )
 
@@ -21,6 +23,9 @@ var validClientID = regexp.MustCompile(`\A[A-Za-z0-9._-]+\z`)
 
 // Config is used to pass multiple configuration options to Sarama's constructors.
 type Config struct {
+	Metrics struct {
+		OpenTelemetry OpenTelemetryMetricsConfig
+	}
 	// Admin is the namespace for ClusterAdmin properties used by the administrative Kafka client.
 	Admin struct {
 		Retry struct {
@@ -521,8 +526,21 @@ type Config struct {
 	// Defaults to a local registry.
 	// If you want to disable metrics gathering, set "metrics.UseNilMetrics" to "true"
 	// prior to starting Sarama.
-	// See Examples on how to use the metrics registry
+	// See Examples on how to use the metrics registry.
+	// Deprecated: go-metrics support is deprecated and will be removed in v2;
+	// use Config.Metrics.OpenTelemetry instead.
 	MetricRegistry metrics.Registry
+
+	metricsRegistryInternal metrics.Registry
+}
+
+type OpenTelemetryMetricsConfig struct {
+	Enabled       bool
+	MeterProvider metric.MeterProvider
+	Meter         metric.Meter
+	MeterName     string
+	MeterVersion  string
+	Attributes    []attribute.KeyValue
 }
 
 // NewConfig returns a new configuration instance with sane defaults.
@@ -586,6 +604,28 @@ func NewConfig() *Config {
 	c.MetricRegistry = metrics.NewRegistry()
 
 	return c
+}
+
+func (c *Config) metricRegistry() metrics.Registry {
+	if c.metricsRegistryInternal != nil {
+		return c.metricsRegistryInternal
+	}
+	return c.MetricRegistry
+}
+
+func (c *Config) initMetrics() {
+	if c.metricsRegistryInternal != nil {
+		return
+	}
+
+	internalRegistry := c.MetricRegistry
+	if c.Metrics.OpenTelemetry.Enabled {
+		otelRecorder := newOTelMetrics(c.Metrics.OpenTelemetry)
+		if otelRecorder != nil {
+			internalRegistry = newOTelRegistry(c.MetricRegistry, otelRecorder)
+		}
+	}
+	c.metricsRegistryInternal = internalRegistry
 }
 
 // Validate checks a Config instance. It will return a

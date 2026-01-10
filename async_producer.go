@@ -142,7 +142,7 @@ func newAsyncProducer(client Client) (AsyncProducer, error) {
 		brokers:         make(map[*Broker]*brokerProducer),
 		brokerRefs:      make(map[*brokerProducer]int),
 		txnmgr:          txnmgr,
-		metricsRegistry: newCleanupRegistry(client.Config().MetricRegistry),
+		metricsRegistry: newCleanupRegistry(client.Config().metricRegistry()),
 	}
 
 	// launch our singleton dispatchers

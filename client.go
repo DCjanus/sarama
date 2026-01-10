@@ -184,6 +184,7 @@ func NewClient(addrs []string, conf *Config) (Client, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
+	conf.initMetrics()
 
 	if len(addrs) < 1 {
 		return nil, ConfigurationError("You must provide at least one broker address")

@@ -137,7 +137,7 @@ func newConsumer(client Client) (Consumer, error) {
 		conf:            client.Config(),
 		children:        make(map[string]map[int32]*partitionConsumer),
 		brokerConsumers: make(map[*Broker]*brokerConsumer),
-		metricRegistry:  newCleanupRegistry(client.Config().MetricRegistry),
+		metricRegistry:  newCleanupRegistry(client.Config().metricRegistry()),
 	}
 
 	return c, nil
