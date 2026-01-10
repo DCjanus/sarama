@@ -175,6 +175,7 @@ func (b *Broker) Open(conf *Config) error {
 	if err != nil {
 		return err
 	}
+	conf.initMetrics()
 
 	b.lock.Lock()
 
