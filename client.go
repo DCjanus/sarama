@@ -117,6 +117,10 @@ type Client interface {
 	// PartitionNotReadable checks if partition is not readable
 	PartitionNotReadable(topic string, partition int32) bool
 
+	// MetadataSnapshot returns a read-only copy of the current cached metadata without triggering a refresh.
+	// The snapshot may be stale if no metadata refresh has occurred yet.
+	MetadataSnapshot() *MetadataSnapshot
+
 	// Close shuts down all broker connections managed by this client. It is required
 	// to call this function before a client object passes out of scope, as it will
 	// otherwise leak memory. You must close any Producers or Consumers using a client
