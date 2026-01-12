@@ -1338,7 +1338,11 @@ func (client *client) MetadataSnapshot() *MetadataSnapshot {
 	for topic, partitions := range client.metadata {
 		pmap := make(map[int32]PartitionMetadata, len(partitions))
 		for pid, pm := range partitions {
-			pmap[pid] = *pm // struct copy to detach from internal cache
+			clone := *pm // struct copy to detach from internal cache
+			clone.Replicas = slices.Clone(pm.Replicas)
+			clone.Isr = slices.Clone(pm.Isr)
+			clone.OfflineReplicas = slices.Clone(pm.OfflineReplicas)
+			pmap[pid] = clone
 		}
 		snapshot.Topics[topic] = pmap
 	}
