@@ -16,13 +16,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// MetadataSnapshot provides a read-only view of the client's cached metadata.
-// It does not trigger network calls and may be stale if no refresh has happened yet.
-type MetadataSnapshot struct {
-	Brokers   map[int32]string
-	Topics    map[string]map[int32]PartitionMetadata
-}
-
 // Client is a generic Kafka client. It manages connections to one or more Kafka brokers.
 // You MUST call Close() on a client to avoid leaks, it will not be garbage-collected
 // automatically when it passes out of scope. It is safe to share a client amongst many
@@ -1297,10 +1290,6 @@ func (ncc *nopCloserClient) Close() error {
 	return nil
 }
 
-func (ncc *nopCloserClient) MetadataSnapshot() *MetadataSnapshot {
-	return ncc.Client.MetadataSnapshot()
-}
-
 func (client *client) PartitionNotReadable(topic string, partition int32) bool {
 	client.lock.RLock()
 	defer client.lock.RUnlock()
@@ -1310,42 +1299,4 @@ func (client *client) PartitionNotReadable(topic string, partition int32) bool {
 		return true
 	}
 	return pm.Leader == -1
-}
-
-// MetadataSnapshot returns a copy of the current cached metadata without triggering a refresh.
-// It is safe for concurrent use and the returned snapshot is disconnected from internal caches.
-func (client *client) MetadataSnapshot() *MetadataSnapshot {
-	if client.Closed() {
-		return nil
-	}
-
-	client.lock.RLock()
-	defer client.lock.RUnlock()
-
-	if client.updateMetadataMs.Load() == 0 {
-		return nil
-	}
-
-	snapshot := &MetadataSnapshot{
-		Brokers:   make(map[int32]string, len(client.brokers)),
-		Topics:    make(map[string]map[int32]PartitionMetadata, len(client.metadata)),
-	}
-
-	for id, broker := range client.brokers {
-		snapshot.Brokers[id] = broker.Addr()
-	}
-
-	for topic, partitions := range client.metadata {
-		pmap := make(map[int32]PartitionMetadata, len(partitions))
-		for pid, pm := range partitions {
-			clone := *pm // struct copy to detach from internal cache
-			clone.Replicas = slices.Clone(pm.Replicas)
-			clone.Isr = slices.Clone(pm.Isr)
-			clone.OfflineReplicas = slices.Clone(pm.OfflineReplicas)
-			pmap[pid] = clone
-		}
-		snapshot.Topics[topic] = pmap
-	}
-
-	return snapshot
 }
