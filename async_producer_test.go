@@ -2050,6 +2050,7 @@ func (c *stubLeaderClient) RefreshTransactionCoordinator(string) error       { r
 func (c *stubLeaderClient) InitProducerID() (*InitProducerIDResponse, error) { return nil, nil }
 func (c *stubLeaderClient) LeastLoadedBroker() *Broker                       { return c.leader }
 func (c *stubLeaderClient) PartitionNotReadable(string, int32) bool          { return false }
+func (c *stubLeaderClient) MetadataSnapshot() *MetadataSnapshot              { return nil }
 func (c *stubLeaderClient) Close() error                                     { return nil }
 func (c *stubLeaderClient) Closed() bool                                     { return false }
 
