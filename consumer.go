@@ -405,15 +405,16 @@ type partitionConsumerResponse struct {
 }
 
 type brokerConsumerLease struct {
+	consumer *consumer
 	broker   *brokerConsumer
 	released atomic.Bool
 }
 
-func (lease *brokerConsumerLease) release(c *consumer) {
+func (lease *brokerConsumerLease) release() {
 	if lease == nil || !lease.released.CompareAndSwap(false, true) {
 		return
 	}
-	c.unrefBrokerConsumer(lease.broker)
+	lease.consumer.unrefBrokerConsumer(lease.broker)
 }
 
 type partitionConsumer struct {
@@ -508,8 +509,11 @@ func (child *partitionConsumer) stopDispatcher() {
 }
 
 func (child *partitionConsumer) attachBroker(broker *brokerConsumer) {
-	previous := child.broker.Swap(&brokerConsumerLease{broker: broker})
-	previous.release(child.consumer)
+	previous := child.broker.Swap(&brokerConsumerLease{
+		consumer: child.consumer,
+		broker:   broker,
+	})
+	previous.release()
 }
 
 func (child *partitionConsumer) currentBroker() *brokerConsumer {
@@ -522,7 +526,7 @@ func (child *partitionConsumer) currentBroker() *brokerConsumer {
 
 func (child *partitionConsumer) releaseBroker() {
 	lease := child.broker.Swap(nil)
-	lease.release(child.consumer)
+	lease.release()
 }
 
 func (child *partitionConsumer) releaseBrokerIf(broker *brokerConsumer) {
@@ -532,7 +536,7 @@ func (child *partitionConsumer) releaseBrokerIf(broker *brokerConsumer) {
 			return
 		}
 		if child.broker.CompareAndSwap(lease, nil) {
-			lease.release(child.consumer)
+			lease.release()
 			return
 		}
 	}
