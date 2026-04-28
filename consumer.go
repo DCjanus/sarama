@@ -191,12 +191,13 @@ func (c *consumer) ConsumePartition(topic string, partition int32, offset int64)
 
 	child.leaderEpoch = epoch
 	for {
-		child.broker = c.refBrokerConsumer(leader)
-		if child.broker.queueSubscription(child) {
+		bc := c.refBrokerConsumer(leader)
+		child.attachBroker(bc)
+		if bc.queueSubscription(child) {
 			break
 		}
 
-		c.unrefBrokerConsumer(child.broker)
+		child.releaseBrokerIf(bc)
 	}
 
 	return child, nil
@@ -403,12 +404,24 @@ type partitionConsumerResponse struct {
 	response *FetchResponse
 }
 
+type brokerConsumerLease struct {
+	broker   *brokerConsumer
+	released atomic.Bool
+}
+
+func (lease *brokerConsumerLease) release(c *consumer) {
+	if lease == nil || !lease.released.CompareAndSwap(false, true) {
+		return
+	}
+	c.unrefBrokerConsumer(lease.broker)
+}
+
 type partitionConsumer struct {
 	highWaterMarkOffset atomic.Int64 // must be at the top of the struct because https://golang.org/pkg/sync/atomic/#pkg-note-BUG
 
 	consumer *consumer
 	conf     *Config
-	broker   *brokerConsumer
+	broker   atomic.Pointer[brokerConsumerLease]
 	messages chan *ConsumerMessage
 	errors   chan *ConsumerError
 	feeder   chan *partitionConsumerResponse
@@ -494,6 +507,37 @@ func (child *partitionConsumer) stopDispatcher() {
 	})
 }
 
+func (child *partitionConsumer) attachBroker(broker *brokerConsumer) {
+	previous := child.broker.Swap(&brokerConsumerLease{broker: broker})
+	previous.release(child.consumer)
+}
+
+func (child *partitionConsumer) currentBroker() *brokerConsumer {
+	lease := child.broker.Load()
+	if lease == nil || lease.released.Load() {
+		return nil
+	}
+	return lease.broker
+}
+
+func (child *partitionConsumer) releaseBroker() {
+	lease := child.broker.Swap(nil)
+	lease.release(child.consumer)
+}
+
+func (child *partitionConsumer) releaseBrokerIf(broker *brokerConsumer) {
+	for {
+		lease := child.broker.Load()
+		if lease == nil || lease.broker != broker {
+			return
+		}
+		if child.broker.CompareAndSwap(lease, nil) {
+			lease.release(child.consumer)
+			return
+		}
+	}
+}
+
 func (child *partitionConsumer) computeBackoff() time.Duration {
 	if child.conf.Consumer.Retry.BackoffFunc != nil {
 		retries := child.retries.Add(1)
@@ -504,9 +548,7 @@ func (child *partitionConsumer) computeBackoff() time.Duration {
 
 func (child *partitionConsumer) dispatcher() {
 	defer func() {
-		if child.broker != nil {
-			child.consumer.unrefBrokerConsumer(child.broker)
-		}
+		child.releaseBroker()
 		child.consumer.removeChild(child)
 		close(child.feeder)
 	}()
@@ -522,15 +564,12 @@ func (child *partitionConsumer) dispatcher() {
 		case <-child.dispatcherStop:
 			return
 		case <-child.dying:
-			if child.broker == nil {
+			if child.currentBroker() == nil {
 				return
 			}
 			continue
 		case <-time.After(child.computeBackoff()):
-			if child.broker != nil {
-				child.consumer.unrefBrokerConsumer(child.broker)
-				child.broker = nil
-			}
+			child.releaseBroker()
 
 			if err := child.dispatch(); err != nil {
 				select {
@@ -578,12 +617,13 @@ func (child *partitionConsumer) dispatch() error {
 	}
 	child.leaderEpoch = epoch
 	for {
-		child.broker = child.consumer.refBrokerConsumer(broker)
-		if child.broker.queueSubscription(child) {
+		bc := child.consumer.refBrokerConsumer(broker)
+		child.attachBroker(bc)
+		if bc.queueSubscription(child) {
 			return nil
 		}
 
-		child.consumer.unrefBrokerConsumer(child.broker)
+		child.releaseBrokerIf(bc)
 	}
 }
 
@@ -662,7 +702,7 @@ feederLoop:
 	for feederResponse := range child.feeder {
 		broker := feederResponse.broker
 
-		msgs, child.responseResult = child.parseResponse(feederResponse.response)
+		msgs, child.responseResult = child.parseResponse(broker, feederResponse.response)
 
 		if child.responseResult == nil {
 			child.retries.Store(0)
@@ -774,17 +814,21 @@ func (child *partitionConsumer) parseRecords(batch *RecordBatch) ([]*ConsumerMes
 	return messages, nil
 }
 
-func (child *partitionConsumer) parseResponse(response *FetchResponse) ([]*ConsumerMessage, error) {
+func (child *partitionConsumer) parseResponse(broker *brokerConsumer, response *FetchResponse) ([]*ConsumerMessage, error) {
 	var consumerBatchSizeMetric metrics.Histogram
 	if child.consumer != nil && child.consumer.metricRegistry != nil {
 		consumerBatchSizeMetric = getOrRegisterHistogram("consumer-batch-size", child.consumer.metricRegistry)
+	}
+
+	if broker == nil {
+		return nil, ErrIncompleteResponse
 	}
 
 	// If request was throttled and empty we log and return without error
 	if response.ThrottleTime != time.Duration(0) && len(response.Blocks) == 0 {
 		Logger.Printf(
 			"consumer/broker/%d FetchResponse throttled %v\n",
-			child.broker.broker.ID(), response.ThrottleTime)
+			broker.broker.ID(), response.ThrottleTime)
 		return nil, nil
 	}
 
@@ -834,7 +878,7 @@ func (child *partitionConsumer) parseResponse(response *FetchResponse) ([]*Consu
 			}
 		} else if block.recordsNextOffset != nil && *block.recordsNextOffset <= block.HighWaterMarkOffset {
 			// check last record next offset to avoid stuck if high watermark was not reached
-			Logger.Printf("consumer/broker/%d received batch with zero records but high watermark was not reached, topic %s, partition %d, next offset %d\n", child.broker.broker.ID(), child.topic, child.partition, *block.recordsNextOffset)
+			Logger.Printf("consumer/broker/%d received batch with zero records but high watermark was not reached, topic %s, partition %d, next offset %d\n", broker.broker.ID(), child.topic, child.partition, *block.recordsNextOffset)
 			child.offset = *block.recordsNextOffset
 		}
 
@@ -1129,6 +1173,7 @@ func (bc *brokerConsumer) handleResponses() {
 						bc.broker.ID(), preferredBroker.ID())
 					child.triggerRedispatch()
 					delete(bc.subscriptions, child)
+					child.releaseBrokerIf(bc)
 				}
 			}
 			continue
@@ -1160,6 +1205,7 @@ func (bc *brokerConsumer) handleResponses() {
 				bc.broker.ID(), child.topic, child.partition, result)
 			child.triggerRedispatch()
 			delete(bc.subscriptions, child)
+			child.releaseBrokerIf(bc)
 		} else {
 			// dunno, tell the user and try redispatching
 			child.sendError(result)
@@ -1167,6 +1213,7 @@ func (bc *brokerConsumer) handleResponses() {
 				bc.broker.ID(), child.topic, child.partition, result)
 			child.triggerRedispatch()
 			delete(bc.subscriptions, child)
+			child.releaseBrokerIf(bc)
 		}
 	}
 }
@@ -1177,6 +1224,7 @@ func (bc *brokerConsumer) abort(err error) {
 	_ = bc.broker.Close() // we don't care about the error this might return, we already have one
 
 	for child := range bc.subscriptions {
+		child.releaseBrokerIf(bc)
 		select {
 		case <-child.dying:
 			child.stopDispatcher()
@@ -1187,6 +1235,7 @@ func (bc *brokerConsumer) abort(err error) {
 
 	for newSubscriptions := range bc.newSubscriptions {
 		for _, child := range newSubscriptions {
+			child.releaseBrokerIf(bc)
 			select {
 			case <-child.dying:
 				child.stopDispatcher()

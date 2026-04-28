@@ -1725,7 +1725,6 @@ func TestPartitionConsumerBrokerRace(t *testing.T) {
 
 	child := &partitionConsumer{
 		conf:           config,
-		broker:         broker,
 		messages:       make(chan *ConsumerMessage, 1),
 		errors:         make(chan *ConsumerError, 1),
 		feeder:         make(chan *partitionConsumerResponse, 1),
@@ -1761,7 +1760,7 @@ func TestPartitionConsumerBrokerRace(t *testing.T) {
 			case <-done:
 				return
 			default:
-				child.broker = broker
+				child.broker.Store(&brokerConsumerLease{broker: broker})
 				runtime.Gosched()
 			}
 		}
@@ -1815,7 +1814,6 @@ func TestPartitionConsumerAsyncCloseAfterBrokerAbandonsForRedispatch(t *testing.
 	child := &partitionConsumer{
 		consumer:       c,
 		conf:           config,
-		broker:         bc,
 		messages:       make(chan *ConsumerMessage),
 		errors:         make(chan *ConsumerError),
 		feeder:         make(chan *partitionConsumerResponse),
@@ -1825,6 +1823,7 @@ func TestPartitionConsumerAsyncCloseAfterBrokerAbandonsForRedispatch(t *testing.
 		topic:          "my_topic",
 		partition:      0,
 	}
+	child.attachBroker(bc)
 	c.children[child.topic] = map[int32]*partitionConsumer{child.partition: child}
 
 	bc.subscriptions[child] = none{}
@@ -2126,14 +2125,14 @@ func Test_partitionConsumer_parseResponse(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			broker := &brokerConsumer{
+				broker: &Broker{},
+			}
 			child := &partitionConsumer{
-				broker: &brokerConsumer{
-					broker: &Broker{},
-				},
 				conf:           &Config{},
 				dispatcherStop: make(chan none),
 			}
-			got, err := child.parseResponse(tt.args.response)
+			got, err := child.parseResponse(broker, tt.args.response)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("partitionConsumer.parseResponse() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -2157,16 +2156,16 @@ func Test_partitionConsumer_parseResponseEmptyBatch(t *testing.T) {
 		Blocks:  map[string]map[int32]*FetchResponseBlock{"my_topic": {0: block}},
 		Version: 2,
 	}
+	broker := &brokerConsumer{
+		broker: &Broker{},
+	}
 	child := &partitionConsumer{
-		broker: &brokerConsumer{
-			broker: &Broker{},
-		},
 		conf:           NewTestConfig(),
 		topic:          "my_topic",
 		partition:      0,
 		dispatcherStop: make(chan none),
 	}
-	got, err := child.parseResponse(response)
+	got, err := child.parseResponse(broker, response)
 	if err != nil {
 		t.Errorf("partitionConsumer.parseResponse() error = %v", err)
 		return
