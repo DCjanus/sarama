@@ -1725,7 +1725,6 @@ func TestPartitionConsumerBrokerRace(t *testing.T) {
 
 	child := &partitionConsumer{
 		conf:           config,
-		broker:         broker,
 		messages:       make(chan *ConsumerMessage, 1),
 		errors:         make(chan *ConsumerError, 1),
 		feeder:         make(chan *partitionConsumerResponse, 1),
@@ -1761,7 +1760,7 @@ func TestPartitionConsumerBrokerRace(t *testing.T) {
 			case <-done:
 				return
 			default:
-				child.broker = broker
+				child.broker.Store(&brokerConsumerLease{broker: broker})
 				runtime.Gosched()
 			}
 		}
@@ -1780,6 +1779,79 @@ func TestPartitionConsumerBrokerRace(t *testing.T) {
 
 	<-feederDone
 	<-messagesDone
+}
+
+func TestPartitionConsumerAsyncCloseAfterBrokerAbandonsForRedispatch(t *testing.T) {
+	config := NewTestConfig()
+	dispatchStarted := make(chan none, 1)
+	config.Consumer.Retry.BackoffFunc = func(retries int) time.Duration {
+		select {
+		case dispatchStarted <- none{}:
+		default:
+		}
+		return time.Hour
+	}
+
+	c := &consumer{
+		conf:            config,
+		children:        make(map[string]map[int32]*partitionConsumer),
+		brokerConsumers: make(map[*Broker]*brokerConsumer),
+		metricRegistry:  newCleanupRegistry(config.MetricRegistry),
+	}
+
+	realBroker := &Broker{}
+	bc := &brokerConsumer{
+		consumer:         c,
+		broker:           realBroker,
+		input:            make(chan *partitionConsumer),
+		newSubscriptions: make(chan []*partitionConsumer),
+		subscriptions:    make(map[*partitionConsumer]none),
+		refs:             1,
+		stop:             make(chan none),
+	}
+	c.brokerConsumers[realBroker] = bc
+
+	child := &partitionConsumer{
+		consumer:       c,
+		conf:           config,
+		messages:       make(chan *ConsumerMessage),
+		errors:         make(chan *ConsumerError),
+		feeder:         make(chan *partitionConsumerResponse),
+		trigger:        make(chan none, 1),
+		dying:          make(chan none),
+		dispatcherStop: make(chan none),
+		topic:          "my_topic",
+		partition:      0,
+	}
+	child.attachBroker(bc)
+	c.children[child.topic] = map[int32]*partitionConsumer{child.partition: child}
+
+	bc.subscriptions[child] = none{}
+	child.responseResult = ErrFencedLeaderEpoch
+
+	done := make(chan none)
+	go func() {
+		child.dispatcher()
+		close(done)
+	}()
+
+	bc.handleResponses()
+
+	select {
+	case <-dispatchStarted:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("dispatcher did not begin waiting to redispatch")
+	}
+
+	child.AsyncClose()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		child.stopDispatcher()
+		<-done
+		t.Fatal("dispatcher did not exit after AsyncClose during redispatch backoff")
+	}
 }
 
 func TestConsumerTimestamps(t *testing.T) {
@@ -2053,14 +2125,14 @@ func Test_partitionConsumer_parseResponse(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			broker := &brokerConsumer{
+				broker: &Broker{},
+			}
 			child := &partitionConsumer{
-				broker: &brokerConsumer{
-					broker: &Broker{},
-				},
 				conf:           &Config{},
 				dispatcherStop: make(chan none),
 			}
-			got, err := child.parseResponse(tt.args.response)
+			got, err := child.parseResponse(broker, tt.args.response)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("partitionConsumer.parseResponse() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -2084,16 +2156,16 @@ func Test_partitionConsumer_parseResponseEmptyBatch(t *testing.T) {
 		Blocks:  map[string]map[int32]*FetchResponseBlock{"my_topic": {0: block}},
 		Version: 2,
 	}
+	broker := &brokerConsumer{
+		broker: &Broker{},
+	}
 	child := &partitionConsumer{
-		broker: &brokerConsumer{
-			broker: &Broker{},
-		},
 		conf:           NewTestConfig(),
 		topic:          "my_topic",
 		partition:      0,
 		dispatcherStop: make(chan none),
 	}
-	got, err := child.parseResponse(response)
+	got, err := child.parseResponse(broker, response)
 	if err != nil {
 		t.Errorf("partitionConsumer.parseResponse() error = %v", err)
 		return
