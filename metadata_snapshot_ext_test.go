@@ -23,10 +23,10 @@ func TestMetadataSnapshotCopyAndNoRefresh(t *testing.T) {
 
 	snap := client.MetadataSnapshot()
 	require.NotNil(t, snap)
-	require.Equal(t, 2, len(snap.Brokers))
+	require.Len(t, snap.Brokers, 2)
 	require.Equal(t, "addr1", snap.Brokers[1])
 	require.Equal(t, "addr2", snap.Brokers[2])
-	require.Equal(t, 2, len(snap.Topics["foo"]))
+	require.Len(t, snap.Topics["foo"], 2)
 
 	// mutate snapshot; internal cache should remain unchanged
 	snap.Brokers[1] = "mutated"
