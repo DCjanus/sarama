@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +18,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func socketErrorProbeAvailable() bool {
+	switch runtime.GOOS {
+	case "aix", "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris":
+		return true
+	default:
+		return false
+	}
+}
 
 func TestSimpleClient(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
@@ -456,8 +467,10 @@ func TestClientReceivingPartialMetadata(t *testing.T) {
 	metadataPartial.AddTopicPartition("new_topic", 1, -1, replicas, []int32{}, []int32{}, ErrLeaderNotAvailable)
 	leader.Returns(metadataPartial)
 
-	if err := client.RefreshMetadata("new_topic"); err != nil {
-		t.Error("ErrLeaderNotAvailable should not make RefreshMetadata respond with an error")
+	// the leaderless error is now propagated so callers can back off (#3514);
+	// partial partition data is still cached for the lookups below
+	if err := client.RefreshMetadata("new_topic"); !errors.Is(err, ErrLeaderNotAvailable) {
+		t.Error("Expected ErrLeaderNotAvailable, got", err)
 	}
 
 	// Even though the metadata was incomplete, we should be able to get the leader of a partition
@@ -746,6 +759,129 @@ func TestClientResurrectDeadSeeds(t *testing.T) {
 	safeClose(t, c)
 }
 
+func TestClientCheckBrokersHealth(t *testing.T) {
+	newConnectedBroker := func(t *testing.T) (*Broker, *net.TCPConn, func()) {
+		t.Helper()
+
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		accepted := make(chan *net.TCPConn, 1)
+		acceptErr := make(chan error, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				acceptErr <- err
+				return
+			}
+			accepted <- conn.(*net.TCPConn)
+		}()
+
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		require.NoError(t, err)
+
+		var serverConn *net.TCPConn
+		select {
+		case serverConn = <-accepted:
+		case err := <-acceptErr:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "timed out waiting for test broker connection")
+		}
+
+		broker := NewBroker(listener.Addr().String())
+		broker.conn = conn.(*net.TCPConn)
+		broker.metricRegistry = metrics.NewRegistry()
+		broker.opened.Store(true)
+
+		cleanup := func() {
+			_ = listener.Close()
+			_ = serverConn.Close()
+			_ = broker.Close()
+		}
+
+		return broker, serverConn, cleanup
+	}
+
+	t.Run("does not wait for brokers that are opening", func(t *testing.T) {
+		broker := &Broker{id: 1, addr: "127.0.0.1:9092"}
+		broker.lock.Lock()
+		defer broker.lock.Unlock()
+
+		client := &client{
+			brokers: map[int32]*Broker{broker.ID(): broker},
+		}
+
+		done := make(chan struct{})
+		go func() {
+			client.checkBrokersHealth()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(100 * time.Millisecond):
+			require.FailNow(t, "checkBrokersHealth blocked on a broker that was still opening")
+		}
+	})
+
+	t.Run("keeps unhealthy live seed brokers available for reopening", func(t *testing.T) {
+		if !socketErrorProbeAvailable() {
+			t.Skip("socket error probing is unavailable on this platform")
+		}
+
+		broker, serverConn, cleanup := newConnectedBroker(t)
+		defer cleanup()
+
+		client := &client{
+			brokers:     map[int32]*Broker{},
+			seedBrokers: []*Broker{broker},
+		}
+
+		require.NoError(t, serverConn.SetLinger(0))
+		require.NoError(t, serverConn.Close())
+
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			client.checkBrokersHealth()
+
+			assert.Len(c, client.seedBrokers, 1)
+			assert.Same(c, broker, client.seedBrokers[0])
+
+			connected, err := broker.Connected()
+			assert.NoError(c, err)
+			assert.False(c, connected)
+		}, time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("keeps unhealthy dead seed brokers available for reopening", func(t *testing.T) {
+		if !socketErrorProbeAvailable() {
+			t.Skip("socket error probing is unavailable on this platform")
+		}
+
+		broker, serverConn, cleanup := newConnectedBroker(t)
+		defer cleanup()
+
+		client := &client{
+			brokers:   map[int32]*Broker{},
+			deadSeeds: []*Broker{broker},
+		}
+
+		require.NoError(t, serverConn.SetLinger(0))
+		require.NoError(t, serverConn.Close())
+
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			client.checkBrokersHealth()
+
+			assert.Len(c, client.deadSeeds, 1)
+			assert.Same(c, broker, client.deadSeeds[0])
+
+			connected, err := broker.Connected()
+			assert.NoError(c, err)
+			assert.False(c, connected)
+		}, time.Second, 10*time.Millisecond)
+	})
+}
+
 //nolint:paralleltest
 func TestClientController(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
@@ -879,6 +1015,46 @@ func TestClientMetadataTimeout(t *testing.T) {
 			})
 		}
 	}
+}
+
+// covers #3514: when every partition is leaderless (e.g. all brokers
+// rebooting), the metadata refresh path used to swallow the leaderless
+// condition and return nil, leaving the async producer dispatcher to spin.
+func TestClientRefreshMetadataLeaderless(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	initial := new(MetadataResponse)
+	initial.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
+	seedBroker.Returns(initial)
+
+	config := NewTestConfig()
+	config.Metadata.Retry.Max = 2
+	config.Metadata.Retry.Backoff = 1 * time.Millisecond
+	c, err := NewClient([]string{seedBroker.Addr()}, config)
+	require.NoError(t, err)
+	defer safeClose(t, c)
+
+	client := c.(*client)
+	client.updateMetadataMs.Store(0)
+
+	leaderless := new(MetadataResponse)
+	leaderless.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
+	leaderless.AddTopicPartition("ll_topic", 0, -1, []int32{1}, []int32{}, []int32{}, ErrLeaderNotAvailable)
+	// initial attempt + Retry.Max retries
+	seedBroker.Returns(leaderless)
+	seedBroker.Returns(leaderless)
+	seedBroker.Returns(leaderless)
+
+	err = c.RefreshMetadata("ll_topic")
+
+	require.ErrorIs(t, err, ErrLeaderNotAvailable,
+		"RefreshMetadata should return ErrLeaderNotAvailable when all partitions are leaderless")
+
+	// updating the timestamp on a failed refresh lets concurrent
+	// refreshes short-circuit each other's retries
+	assert.Zero(t, client.updateMetadataMs.Load(),
+		"updateMetadataMs should only advance after a successful refresh")
 }
 
 func TestClientUpdateMetadataErrorAndRetry(t *testing.T) {
