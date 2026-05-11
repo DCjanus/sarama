@@ -1072,7 +1072,7 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 	return retry(error)
 }
 
-// if no fatal error, returns a list of topics that need retrying due to ErrLeaderNotAvailable
+// if no fatal error, records per-topic errors and whether any topic needs retrying.
 func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bool) (retry bool, err error) {
 	if client.Closed() {
 		return
@@ -1103,6 +1103,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		client.metadataTopics = make(map[string]none)
 		client.cachedPartitionsResults = make(map[string][maxPartitionIndex][]int32)
 	}
+	result := &metadataRefreshResult{}
 	for _, topic := range data.Topics {
 		// topics must be added firstly to `metadataTopics` to guarantee that all
 		// requested topics must be recorded to keep them trackable for periodically
@@ -1117,18 +1118,18 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		case ErrNoError:
 			// no-op
 		case ErrInvalidTopic, ErrTopicAuthorizationFailed: // don't retry, don't store partial results
-			err = topic.Err
+			result.setTopicError(topic.Name, topic.Err)
 			continue
 		case ErrUnknownTopicOrPartition: // retry, do not store partial partition results
-			err = topic.Err
+			result.setTopicError(topic.Name, topic.Err)
 			retry = true
 			continue
 		case ErrLeaderNotAvailable: // retry, but store partial partition results
-			err = topic.Err
+			result.setTopicError(topic.Name, topic.Err)
 			retry = true
 		default: // don't retry, don't store partial results
 			Logger.Printf("Unexpected topic-level metadata error: %s", topic.Err)
-			err = topic.Err
+			result.setTopicError(topic.Name, topic.Err)
 			continue
 		}
 
@@ -1136,7 +1137,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		for _, partition := range topic.Partitions {
 			client.metadata[topic.Name][partition.ID] = partition
 			if errors.Is(partition.Err, ErrLeaderNotAvailable) {
-				err = partition.Err
+				result.setTopicError(topic.Name, partition.Err)
 				retry = true
 			}
 		}
@@ -1146,6 +1147,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		partitionCache[writablePartitions] = client.setPartitionCache(topic.Name, writablePartitions)
 		client.cachedPartitionsResults[topic.Name] = partitionCache
 	}
+	err = result.errOrNil()
 
 	return
 }

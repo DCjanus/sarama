@@ -1,10 +1,66 @@
 package sarama
 
 import (
+	"errors"
 	"sync"
 )
 
 type metadataRefresh func(topics []string) error
+
+type metadataRefreshResult struct {
+	topicErrors map[string]error
+}
+
+func (r *metadataRefreshResult) Error() string {
+	if err := r.firstErrorFor(nil); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func (r *metadataRefreshResult) setTopicError(topic string, err KError) {
+	if err == ErrNoError {
+		return
+	}
+	if r.topicErrors == nil {
+		r.topicErrors = make(map[string]error)
+	}
+	r.topicErrors[topic] = err
+}
+
+func (r *metadataRefreshResult) errOrNil() error {
+	if len(r.topicErrors) == 0 {
+		return nil
+	}
+	return r
+}
+
+// firstErrorFor returns a topic error visible to a caller that requested topics.
+// Empty topics means all topics, so any topic-specific error may be returned.
+func (r *metadataRefreshResult) firstErrorFor(topics []string) error {
+	if len(r.topicErrors) == 0 {
+		return nil
+	}
+	if len(topics) == 0 {
+		for _, err := range r.topicErrors {
+			return err
+		}
+	}
+	for _, topic := range topics {
+		if err := r.topicErrors[topic]; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func firstMetadataRefreshErrorFor(err error, topics []string) error {
+	var result *metadataRefreshResult
+	if errors.As(err, &result) {
+		return result.firstErrorFor(topics)
+	}
+	return err
+}
 
 // currentRefresh makes sure sarama does not issue metadata requests
 // in parallel. If we need to refresh the metadata for a list of topics,
@@ -182,7 +238,7 @@ func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 	for {
 		ch, queued := m.refreshOrQueue(topics)
 		if !queued {
-			return <-ch
+			return firstMetadataRefreshErrorFor(<-ch, topics)
 		}
 		<-ch
 	}
