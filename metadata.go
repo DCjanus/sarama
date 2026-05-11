@@ -242,7 +242,6 @@ func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 		if !queued {
 			return <-ch
 		}
-		// The current refresh does not cover these topics; wait and retry.
 		<-ch
 	}
 }
