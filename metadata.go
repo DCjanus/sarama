@@ -54,6 +54,8 @@ func (e *metadataTopicErrors) firstVisibleErrorFor(topics []string) error {
 	return nil
 }
 
+// firstVisibleMetadataErrorFor leaves non-topic refresh errors unchanged.
+// Topic errors from a shared refresh are filtered to this caller's topics.
 func firstVisibleMetadataErrorFor(err error, topics []string) error {
 	var topicErrors *metadataTopicErrors
 	if errors.As(err, &topicErrors) {
