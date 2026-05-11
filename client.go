@@ -1103,7 +1103,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		client.metadataTopics = make(map[string]none)
 		client.cachedPartitionsResults = make(map[string][maxPartitionIndex][]int32)
 	}
-	result := &metadataRefreshResult{}
+	topicErrors := &metadataTopicErrors{}
 	for _, topic := range data.Topics {
 		// topics must be added firstly to `metadataTopics` to guarantee that all
 		// requested topics must be recorded to keep them trackable for periodically
@@ -1118,18 +1118,18 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		case ErrNoError:
 			// no-op
 		case ErrInvalidTopic, ErrTopicAuthorizationFailed: // don't retry, don't store partial results
-			result.setTopicError(topic.Name, topic.Err)
+			topicErrors.setTopicError(topic.Name, topic.Err)
 			continue
 		case ErrUnknownTopicOrPartition: // retry, do not store partial partition results
-			result.setTopicError(topic.Name, topic.Err)
+			topicErrors.setTopicError(topic.Name, topic.Err)
 			retry = true
 			continue
 		case ErrLeaderNotAvailable: // retry, but store partial partition results
-			result.setTopicError(topic.Name, topic.Err)
+			topicErrors.setTopicError(topic.Name, topic.Err)
 			retry = true
 		default: // don't retry, don't store partial results
 			Logger.Printf("Unexpected topic-level metadata error: %s", topic.Err)
-			result.setTopicError(topic.Name, topic.Err)
+			topicErrors.setTopicError(topic.Name, topic.Err)
 			continue
 		}
 
@@ -1137,7 +1137,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		for _, partition := range topic.Partitions {
 			client.metadata[topic.Name][partition.ID] = partition
 			if errors.Is(partition.Err, ErrLeaderNotAvailable) {
-				result.setTopicError(topic.Name, partition.Err)
+				topicErrors.setTopicError(topic.Name, partition.Err)
 				retry = true
 			}
 		}
@@ -1147,7 +1147,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		partitionCache[writablePartitions] = client.setPartitionCache(topic.Name, writablePartitions)
 		client.cachedPartitionsResults[topic.Name] = partitionCache
 	}
-	err = result.errOrNil()
+	err = topicErrors.errOrNil()
 
 	return
 }

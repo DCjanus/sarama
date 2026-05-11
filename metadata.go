@@ -7,57 +7,57 @@ import (
 
 type metadataRefresh func(topics []string) error
 
-type metadataRefreshResult struct {
+type metadataTopicErrors struct {
 	topicErrors map[string]error
 }
 
-func (r *metadataRefreshResult) Error() string {
-	if err := r.firstErrorFor(nil); err != nil {
+func (e *metadataTopicErrors) Error() string {
+	if err := e.firstVisibleErrorFor(nil); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-func (r *metadataRefreshResult) setTopicError(topic string, err KError) {
+func (e *metadataTopicErrors) setTopicError(topic string, err KError) {
 	if err == ErrNoError {
 		return
 	}
-	if r.topicErrors == nil {
-		r.topicErrors = make(map[string]error)
+	if e.topicErrors == nil {
+		e.topicErrors = make(map[string]error)
 	}
-	r.topicErrors[topic] = err
+	e.topicErrors[topic] = err
 }
 
-func (r *metadataRefreshResult) errOrNil() error {
-	if len(r.topicErrors) == 0 {
+func (e *metadataTopicErrors) errOrNil() error {
+	if len(e.topicErrors) == 0 {
 		return nil
 	}
-	return r
+	return e
 }
 
-// firstErrorFor returns a topic error visible to a caller that requested topics.
+// firstVisibleErrorFor returns a topic error visible to a caller that requested topics.
 // Empty topics means all topics, so any topic-specific error may be returned.
-func (r *metadataRefreshResult) firstErrorFor(topics []string) error {
-	if len(r.topicErrors) == 0 {
+func (e *metadataTopicErrors) firstVisibleErrorFor(topics []string) error {
+	if len(e.topicErrors) == 0 {
 		return nil
 	}
 	if len(topics) == 0 {
-		for _, err := range r.topicErrors {
+		for _, err := range e.topicErrors {
 			return err
 		}
 	}
 	for _, topic := range topics {
-		if err := r.topicErrors[topic]; err != nil {
+		if err := e.topicErrors[topic]; err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func firstMetadataRefreshErrorFor(err error, topics []string) error {
-	var result *metadataRefreshResult
-	if errors.As(err, &result) {
-		return result.firstErrorFor(topics)
+func firstVisibleMetadataErrorFor(err error, topics []string) error {
+	var topicErrors *metadataTopicErrors
+	if errors.As(err, &topicErrors) {
+		return topicErrors.firstVisibleErrorFor(topics)
 	}
 	return err
 }
@@ -238,7 +238,7 @@ func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 	for {
 		ch, queued := m.refreshOrQueue(topics)
 		if !queued {
-			return firstMetadataRefreshErrorFor(<-ch, topics)
+			return firstVisibleMetadataErrorFor(<-ch, topics)
 		}
 		<-ch
 	}
