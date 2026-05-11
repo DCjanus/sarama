@@ -240,7 +240,7 @@ func (m *singleFlightMetadataRefresher) Refresh(topics []string) error {
 	for {
 		ch, queued := m.refreshOrQueue(topics)
 		if !queued {
-			return firstVisibleMetadataErrorFor(<-ch, topics)
+			return <-ch
 		}
 		// The current refresh does not cover these topics; wait and retry.
 		<-ch

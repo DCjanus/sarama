@@ -521,7 +521,7 @@ func (client *client) RefreshMetadata(topics ...string) error {
 	if slices.Contains(topics, "") {
 		return ErrInvalidTopic // this is the error that 0.8.2 and later correctly return
 	}
-	return client.metadataRefresh(topics)
+	return firstVisibleMetadataErrorFor(client.metadataRefresh(topics), topics)
 }
 
 func (client *client) GetOffset(topic string, partitionID int32, timestamp int64) (int64, error) {
