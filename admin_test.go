@@ -5,8 +5,13 @@ package sarama
 import (
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClusterAdmin(t *testing.T) {
@@ -167,20 +172,20 @@ func TestClusterAdminListTopics(t *testing.T) {
 	}
 
 	if len(entries) == 0 {
-		t.Fatal(errors.New("no resource present"))
+		t.Fatal("no resource present")
 	}
 
 	topic, found := entries["my_topic"]
 	if !found {
-		t.Fatal(errors.New("topic not found in response"))
+		t.Fatal("topic not found in response")
 	}
 	_, found = topic.ConfigEntries["max.message.bytes"]
 	if found {
-		t.Fatal(errors.New("default topic config entry incorrectly found in response"))
+		t.Fatal("default topic config entry incorrectly found in response")
 	}
 	value := topic.ConfigEntries["retention.ms"]
 	if value == nil || *value != "5000" {
-		t.Fatal(errors.New("non-default topic config entry not found in response"))
+		t.Fatal("non-default topic config entry not found in response")
 	}
 
 	err = admin.Close()
@@ -188,8 +193,154 @@ func TestClusterAdminListTopics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if topic.ReplicaAssignment == nil || topic.ReplicaAssignment[0][0] != 1 {
-		t.Fatal(errors.New("replica assignment not found in response"))
+	assignment, found := topic.ReplicaAssignment[0]
+	if !found {
+		t.Fatal("replica assignment for partition 0 not found in response")
+	}
+	if len(assignment) == 0 {
+		t.Fatal("replica assignment for partition 0 was empty")
+	}
+	if assignment[0] != 1 {
+		t.Fatal("replica assignment not found in response")
+	}
+}
+
+func TestClusterAdminListTopicsRetriesOnTransientConnectionError(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	metadataResponse := NewMockMetadataResponse(t).
+		SetController(seedBroker.BrokerID()).
+		SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+		SetLeader("my_topic", 0, seedBroker.BrokerID())
+
+	var stateMu sync.Mutex
+	var injectTimeout, injected bool
+	var metadataAttempts int
+
+	seedBroker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": func(req *request) encoderWithHeader {
+			stateMu.Lock()
+			metadataAttempts++
+			shouldInject := injectTimeout && !injected
+			if shouldInject {
+				injected = true
+			}
+			stateMu.Unlock()
+			if shouldInject {
+				return nil
+			}
+			return metadataResponse.For(req.body)
+		},
+		"DescribeConfigsRequest": func(req *request) encoderWithHeader {
+			return NewMockDescribeConfigsResponse(t).For(req.body)
+		},
+	})
+
+	config := NewTestConfig()
+	config.Version = V1_1_0_0
+	config.Net.ReadTimeout = 100 * time.Millisecond
+	config.Admin.Retry.Max = 3
+	config.Admin.Retry.Backoff = 10 * time.Millisecond
+
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, admin)
+
+	stateMu.Lock()
+	injectTimeout = true
+	metadataAttemptsBeforeList := metadataAttempts
+	stateMu.Unlock()
+
+	entries, err := admin.ListTopics()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateMu.Lock()
+	gotInjected := injected
+	gotMetadataAttempts := metadataAttempts
+	stateMu.Unlock()
+	if !gotInjected {
+		t.Fatal("expected metadata timeout to be injected during ListTopics")
+	}
+	if gotMetadataAttempts < metadataAttemptsBeforeList+2 {
+		t.Fatal("expected ListTopics to retry metadata after transient timeout")
+	}
+	if len(entries) == 0 {
+		t.Fatal("no resource present")
+	}
+}
+
+func TestClusterAdminListTopicsRetriesOnDescribeConfigsTimeout(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	metadataResponse := NewMockMetadataResponse(t).
+		SetController(seedBroker.BrokerID()).
+		SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+		SetLeader("my_topic", 0, seedBroker.BrokerID())
+
+	var stateMu sync.Mutex
+	var injectTimeout, injected bool
+	var describeConfigsAttempts int
+	describeConfigsResponse := NewMockDescribeConfigsResponse(t)
+
+	seedBroker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": func(req *request) encoderWithHeader {
+			return metadataResponse.For(req.body)
+		},
+		"DescribeConfigsRequest": func(req *request) encoderWithHeader {
+			stateMu.Lock()
+			describeConfigsAttempts++
+			shouldInject := injectTimeout && !injected
+			if shouldInject {
+				injected = true
+			}
+			stateMu.Unlock()
+			if shouldInject {
+				return nil
+			}
+			return describeConfigsResponse.For(req.body)
+		},
+	})
+
+	config := NewTestConfig()
+	config.Version = V1_1_0_0
+	config.Net.ReadTimeout = 100 * time.Millisecond
+	config.Admin.Retry.Max = 3
+	config.Admin.Retry.Backoff = 10 * time.Millisecond
+
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, admin)
+
+	stateMu.Lock()
+	injectTimeout = true
+	describeConfigsAttemptsBeforeList := describeConfigsAttempts
+	stateMu.Unlock()
+
+	entries, err := admin.ListTopics()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateMu.Lock()
+	gotInjected := injected
+	gotDescribeConfigsAttempts := describeConfigsAttempts
+	stateMu.Unlock()
+	if !gotInjected {
+		t.Fatal("expected DescribeConfigs timeout to be injected during ListTopics")
+	}
+	if gotDescribeConfigsAttempts < describeConfigsAttemptsBeforeList+2 {
+		t.Fatal("expected ListTopics to retry DescribeConfigs after transient timeout")
+	}
+	if len(entries) == 0 {
+		t.Fatal("no resource present")
 	}
 }
 
@@ -1642,6 +1793,206 @@ func TestListConsumerGroupOffsets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// newMockBroker spins up a MockBroker with auto-cleanup.
+func newMockBroker(t *testing.T, id int32) *MockBroker {
+	t.Helper()
+	b := NewMockBroker(t, id)
+	t.Cleanup(func() { b.Close() })
+	return b
+}
+
+// newTestAdmin builds a V2.1 ClusterAdmin against the given seed broker with
+// retry backoff disabled and auto-cleanup.
+func newTestAdmin(t *testing.T, seed *MockBroker) ClusterAdmin {
+	t.Helper()
+	config := NewTestConfig()
+	config.Version = V2_1_0_0
+	config.Admin.Retry.Backoff = 0
+	admin, err := NewClusterAdmin([]string{seed.Addr()}, config)
+	require.NoError(t, err)
+	t.Cleanup(func() { admin.Close() })
+	return admin
+}
+
+// mockMetadataFor builds a MockMetadataResponse with controller and brokers
+// populated. Callers chain .SetLeader as needed.
+func mockMetadataFor(t *testing.T, controller *MockBroker, brokers ...*MockBroker) *MockMetadataResponse {
+	t.Helper()
+	m := NewMockMetadataResponse(t).
+		SetController(controller.BrokerID()).
+		SetBroker(controller.Addr(), controller.BrokerID())
+	for _, b := range brokers {
+		m.SetBroker(b.Addr(), b.BrokerID())
+	}
+	return m
+}
+
+func TestListOffsets(t *testing.T) {
+	const topic = "my-topic"
+
+	t.Run("returns offsets from a single broker", func(t *testing.T) {
+		const partition = int32(0)
+		const timestamp = int64(1690000000000)
+		const expectedOffset = int64(42)
+
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetRequest":   NewMockOffsetResponse(t).SetOffset(topic, partition, timestamp, expectedOffset),
+			"MetadataRequest": mockMetadataFor(t, broker).SetLeader(topic, partition, broker.BrokerID()),
+		})
+
+		result, err := newTestAdmin(t, broker).ListOffsets(map[string]map[int32]int64{
+			topic: {partition: timestamp},
+		}, nil)
+		require.NoError(t, err)
+
+		info := result[topic][partition]
+		require.NotNil(t, info)
+		assert.Equal(t, ErrNoError, info.Err)
+		assert.Equal(t, expectedOffset, info.Offset)
+	})
+
+	t.Run("fans out across partition leaders", func(t *testing.T) {
+		const offset1 = int64(100)
+		const offset2 = int64(200)
+
+		leader1 := newMockBroker(t, 1)
+		leader2 := newMockBroker(t, 2)
+		metadata := mockMetadataFor(t, leader1, leader2).
+			SetLeader(topic, 0, leader1.BrokerID()).
+			SetLeader(topic, 1, leader2.BrokerID())
+
+		leader1.SetHandlerByMap(map[string]MockResponse{
+			"MetadataRequest": metadata,
+			"OffsetRequest":   NewMockOffsetResponse(t).SetOffset(topic, 0, OffsetNewest, offset1),
+		})
+		leader2.SetHandlerByMap(map[string]MockResponse{
+			"MetadataRequest": metadata,
+			"OffsetRequest":   NewMockOffsetResponse(t).SetOffset(topic, 1, OffsetNewest, offset2),
+		})
+
+		result, err := newTestAdmin(t, leader1).ListOffsets(map[string]map[int32]int64{
+			topic: {0: OffsetNewest, 1: OffsetNewest},
+		}, nil)
+		require.NoError(t, err)
+		require.Contains(t, result, topic)
+		assert.Equal(t, offset1, result[topic][0].Offset)
+		assert.Equal(t, offset2, result[topic][1].Offset)
+	})
+
+	t.Run("propagates IsolationLevel to the broker request", func(t *testing.T) {
+		const partition = int32(0)
+
+		broker := newMockBroker(t, 1)
+		metadata := mockMetadataFor(t, broker).SetLeader(topic, partition, broker.BrokerID())
+		offsets := NewMockOffsetResponse(t).SetOffset(topic, partition, OffsetNewest, 42)
+
+		var captured atomic.Int32
+		captured.Store(-1)
+		broker.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+			"MetadataRequest": func(r *request) encoderWithHeader { return metadata.For(r.body) },
+			"OffsetRequest": func(r *request) encoderWithHeader {
+				captured.Store(int32(r.body.(*OffsetRequest).IsolationLevel))
+				return offsets.For(r.body)
+			},
+		})
+
+		_, err := newTestAdmin(t, broker).ListOffsets(map[string]map[int32]int64{
+			topic: {partition: OffsetNewest},
+		}, &ListOffsetsOptions{IsolationLevel: ReadCommitted})
+		require.NoError(t, err)
+		assert.Equal(t, int32(ReadCommitted), captured.Load())
+	})
+
+	t.Run("returns ConfigurationError when no partitions provided", func(t *testing.T) {
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{"MetadataRequest": mockMetadataFor(t, broker)})
+
+		result, err := newTestAdmin(t, broker).ListOffsets(nil, nil)
+		assert.Nil(t, result)
+
+		var cfgErr ConfigurationError
+		require.ErrorAs(t, err, &cfgErr)
+	})
+
+	t.Run("records metadata-resolve failure as a per-partition error", func(t *testing.T) {
+		const knownPartition = int32(0)
+		const missingPartition = int32(1)
+		const expectedOffset = int64(7)
+
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetRequest":   NewMockOffsetResponse(t).SetOffset(topic, knownPartition, OffsetNewest, expectedOffset),
+			"MetadataRequest": mockMetadataFor(t, broker).SetLeader(topic, knownPartition, broker.BrokerID()),
+		})
+
+		result, err := newTestAdmin(t, broker).ListOffsets(map[string]map[int32]int64{
+			topic: {knownPartition: OffsetNewest, missingPartition: OffsetNewest},
+		}, nil)
+		require.NoError(t, err)
+
+		known := result[topic][knownPartition]
+		require.NotNil(t, known)
+		assert.Equal(t, ErrNoError, known.Err)
+		assert.Equal(t, expectedOffset, known.Offset)
+
+		missing := result[topic][missingPartition]
+		require.NotNil(t, missing)
+		assert.ErrorIs(t, missing.Err, ErrUnknownTopicOrPartition)
+	})
+}
+
+func TestAlterConsumerGroupOffsets(t *testing.T) {
+	const (
+		group     = "my-group"
+		topic     = "my-topic"
+		partition = int32(0)
+	)
+	offsets := map[string]map[int32]OffsetAndMetadata{
+		topic: {partition: {Offset: 100, LeaderEpoch: -1}},
+	}
+
+	t.Run("commits offsets via the group coordinator", func(t *testing.T) {
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetCommitRequest":    NewMockOffsetCommitResponse(t).SetError(group, topic, partition, ErrNoError),
+			"FindCoordinatorRequest": NewMockFindCoordinatorResponse(t).SetCoordinator(CoordinatorGroup, group, broker),
+			"MetadataRequest":        mockMetadataFor(t, broker),
+		})
+
+		response, err := newTestAdmin(t, broker).AlterConsumerGroupOffsets(group, offsets, nil)
+		require.NoError(t, err)
+		assert.Equal(t, ErrNoError, response.Errors[topic][partition])
+	})
+
+	t.Run("returns ConfigurationError when no offsets provided", func(t *testing.T) {
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{"MetadataRequest": mockMetadataFor(t, broker)})
+
+		response, err := newTestAdmin(t, broker).AlterConsumerGroupOffsets(group, nil, nil)
+		assert.Nil(t, response)
+
+		var cfgErr ConfigurationError
+		require.ErrorAs(t, err, &cfgErr)
+	})
+
+	t.Run("retries on per-partition NOT_COORDINATOR", func(t *testing.T) {
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetCommitRequest": NewMockSequence(
+				NewMockOffsetCommitResponse(t).SetError(group, topic, partition, ErrNotCoordinatorForConsumer),
+				NewMockOffsetCommitResponse(t).SetError(group, topic, partition, ErrNoError),
+			),
+			"FindCoordinatorRequest": NewMockFindCoordinatorResponse(t).SetCoordinator(CoordinatorGroup, group, broker),
+			"MetadataRequest":        mockMetadataFor(t, broker),
+		})
+
+		response, err := newTestAdmin(t, broker).AlterConsumerGroupOffsets(group, offsets, nil)
+		require.NoError(t, err)
+		assert.Equal(t, ErrNoError, response.Errors[topic][partition])
+	})
 }
 
 func TestDeleteConsumerGroup(t *testing.T) {
