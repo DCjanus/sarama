@@ -7,18 +7,18 @@ import (
 
 type metadataRefresh func(topics []string) error
 
-type metadataTopicErrors struct {
+type topicErrorSet struct {
 	topicErrors map[string]error
 }
 
-func (e *metadataTopicErrors) Error() string {
+func (e *topicErrorSet) Error() string {
 	if err := e.firstVisibleErrorFor(nil); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-func (e *metadataTopicErrors) setTopicError(topic string, err KError) {
+func (e *topicErrorSet) setTopicError(topic string, err KError) {
 	if err == ErrNoError {
 		return
 	}
@@ -28,7 +28,7 @@ func (e *metadataTopicErrors) setTopicError(topic string, err KError) {
 	e.topicErrors[topic] = err
 }
 
-func (e *metadataTopicErrors) errOrNil() error {
+func (e *topicErrorSet) errOrNil() error {
 	if len(e.topicErrors) == 0 {
 		return nil
 	}
@@ -37,7 +37,7 @@ func (e *metadataTopicErrors) errOrNil() error {
 
 // firstVisibleErrorFor returns a topic error visible to a caller that requested topics.
 // Empty topics means all topics, so any topic-specific error may be returned.
-func (e *metadataTopicErrors) firstVisibleErrorFor(topics []string) error {
+func (e *topicErrorSet) firstVisibleErrorFor(topics []string) error {
 	if len(e.topicErrors) == 0 {
 		return nil
 	}
@@ -57,7 +57,7 @@ func (e *metadataTopicErrors) firstVisibleErrorFor(topics []string) error {
 // firstVisibleMetadataErrorFor leaves non-topic refresh errors unchanged.
 // Topic errors from a shared refresh are filtered to this caller's topics.
 func firstVisibleMetadataErrorFor(err error, topics []string) error {
-	var topicErrors *metadataTopicErrors
+	var topicErrors *topicErrorSet
 	if errors.As(err, &topicErrors) {
 		return topicErrors.firstVisibleErrorFor(topics)
 	}
