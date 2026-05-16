@@ -119,6 +119,22 @@ func TestNegotiateApiVersionSelectsLatestUsableVersion(t *testing.T) {
 	}
 }
 
+func TestSupportedApiVersionRangeRestoresOriginalVersion(t *testing.T) {
+	request := NewOffsetRequest(V0_10_1_0)
+	originalVersion := request.version()
+
+	minVersion, maxVersion, ok := supportedApiVersionRange(request)
+	if !ok {
+		t.Fatal("Expected OffsetRequest to have supported versions")
+	}
+	if minVersion != 0 || maxVersion != 5 {
+		t.Fatalf("Expected OffsetRequest range [0,5], got [%d,%d]", minVersion, maxVersion)
+	}
+	if request.version() != originalVersion {
+		t.Fatalf("Expected request version to be restored to %d, got %d", originalVersion, request.version())
+	}
+}
+
 func TestNegotiateApiVersionRejectsMissingBrokerRange(t *testing.T) {
 	request := NewMetadataRequest(MaxVersion, []string{"test-topic"})
 

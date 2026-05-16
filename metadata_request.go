@@ -164,14 +164,6 @@ func (r *MetadataRequest) version() int16 {
 	return r.Version
 }
 
-func (r *MetadataRequest) minVersion() int16 {
-	return 0
-}
-
-func (r *MetadataRequest) maxVersion() int16 {
-	return 10
-}
-
 func (r *MetadataRequest) headerVersion() int16 {
 	if r.Version >= 9 {
 		return 2
