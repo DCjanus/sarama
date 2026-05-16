@@ -900,7 +900,6 @@ func (client *client) getOffset(topic string, partitionID int32, timestamp int64
 	}
 
 	request := NewOffsetRequest(client.conf.versionForRequest(apiKeyListOffsets))
-	client.conf.enableAutoVersionNegotiation(request)
 	request.AddBlock(topic, partitionID, timestamp, 1)
 
 	response, err := broker.GetAvailableOffsets(request)
@@ -1011,7 +1010,6 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 		}
 
 		req := NewMetadataRequest(client.conf.versionForRequest(apiKeyMetadata), topics)
-		client.conf.enableAutoVersionNegotiation(req)
 		req.AllowAutoTopicCreation = allowAutoTopicCreation
 
 		response, err := broker.GetMetadata(req)

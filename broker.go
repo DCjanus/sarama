@@ -1099,7 +1099,7 @@ func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) erro
 
 // b.lock must be held by caller
 func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
-	if b.conf.autoVersionNegotiationEnabled(rb) {
+	if b.conf.autoVersionNegotiationEnabled(rb.key()) {
 		if err := negotiateApiVersion(rb, b.brokerAPIVersions); err != nil {
 			return err
 		}
@@ -1115,7 +1115,7 @@ func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
 		promise.response.setVersion(rb.version())
 	}
 
-	if !b.conf.autoVersionNegotiationEnabled(rb) && !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
+	if !b.conf.autoVersionNegotiationEnabled(rb.key()) && !b.conf.Version.IsAtLeast(rb.requiredVersion()) {
 		return ErrUnsupportedVersion
 	}
 

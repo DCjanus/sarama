@@ -157,21 +157,6 @@ func TestExperimentalVersionForRequestUsesClientMaxForMigratedAPIs(t *testing.T)
 	}
 }
 
-func TestExperimentalAutoVersionNegotiationRequiresRequestOptIn(t *testing.T) {
-	config := NewConfig()
-	config.Experimental.AutoVersionNegotiation = true
-
-	request := NewMetadataRequest(config.versionForRequest(apiKeyMetadata), []string{"test-topic"})
-	if config.autoVersionNegotiationEnabled(request) {
-		t.Fatal("Expected request-level auto negotiation to be disabled before opt-in")
-	}
-
-	config.enableAutoVersionNegotiation(request)
-	if !config.autoVersionNegotiationEnabled(request) {
-		t.Fatal("Expected request-level auto negotiation to be enabled after opt-in")
-	}
-}
-
 func TestExperimentalVersionForRequestLeavesUnmigratedAPIsOnConfiguredVersion(t *testing.T) {
 	config := NewConfig()
 	config.Version = V0_11_0_0
