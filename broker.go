@@ -1099,6 +1099,10 @@ func (b *Broker) sendWithPromise(rb protocolBody, promise *responsePromise) erro
 
 // b.lock must be held by caller
 func (b *Broker) sendInternal(rb protocolBody, promise *responsePromise) error {
+	if b.conf.Version.isAuto() && len(b.brokerAPIVersions) == 0 {
+		return Wrap(ErrUnsupportedVersion, errors.New("AutoVersion requires a broker ApiVersions response"))
+	}
+
 	// try restricting API version to ranges advertised by the broker
 	if err := restrictApiVersion(rb, b.brokerAPIVersions); err != nil {
 		return err
