@@ -1,5 +1,10 @@
 package sarama
 
+import (
+	"fmt"
+	"math"
+)
+
 type apiVersionRange struct {
 	minVersion int16
 	maxVersion int16
@@ -26,6 +31,78 @@ func restrictApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
 	}
 
 	return nil // no version ranges available, no restriction
+}
+
+func negotiateApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
+	brokerVersionRange := brokerVersions[pb.key()]
+	if brokerVersionRange == nil {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d requires a broker ApiVersions response", pb.key()))
+	}
+
+	clientMinVersion, clientMaxVersion, ok := supportedApiVersionRange(pb)
+	if !ok {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d has no supported client API versions", pb.key()))
+	}
+
+	minVersion := max(clientMinVersion, brokerVersionRange.minVersion)
+	maxVersion := min(clientMaxVersion, brokerVersionRange.maxVersion)
+	if minVersion > maxVersion {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d has no usable version in client range [%d,%d] and broker range [%d,%d]",
+			pb.key(), clientMinVersion, clientMaxVersion, brokerVersionRange.minVersion, brokerVersionRange.maxVersion))
+	}
+
+	pb.setVersion(maxVersion)
+	return nil
+}
+
+func supportedApiVersionRange(pb protocolBody) (int16, int16, bool) {
+	originalVersion := pb.version()
+	defer pb.setVersion(originalVersion)
+
+	var (
+		minVersion int16
+		maxVersion int16
+		found      bool
+	)
+	for version := int16(0); ; version++ {
+		pb.setVersion(version)
+		if !pb.isValidVersion() {
+			if found {
+				return minVersion, maxVersion, true
+			}
+			if version == math.MaxInt16 {
+				return 0, 0, false
+			}
+			continue
+		}
+		if !found {
+			minVersion = version
+			found = true
+		}
+		maxVersion = version
+		if version == math.MaxInt16 {
+			return minVersion, maxVersion, true
+		}
+	}
+}
+
+func (c *Config) versionForRequest(apiKey int16) KafkaVersion {
+	if c.autoVersionNegotiationEnabled(apiKey) {
+		return MaxVersion
+	}
+	return c.Version
+}
+
+func (c *Config) autoVersionNegotiationEnabled(apiKey int16) bool {
+	if !c.Experimental.AutoVersionNegotiation {
+		return false
+	}
+	switch apiKey {
+	case apiKeyListOffsets, apiKeyMetadata:
+		return true
+	default:
+		return false
+	}
 }
 
 const (

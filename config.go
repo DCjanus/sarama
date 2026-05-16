@@ -525,6 +525,12 @@ type Config struct {
 	// connection. This defaults to `true` to match the official Java client
 	// and most 3rdparty ones.
 	ApiVersionsRequest bool
+	Experimental       struct {
+		// AutoVersionNegotiation enables experimental request-version selection
+		// from broker ApiVersions responses for a small set of migrated APIs.
+		// This is not yet a stable public API.
+		AutoVersionNegotiation bool
+	}
 	// The version of Kafka that Sarama will assume it is running against.
 	// Defaults to the oldest supported stable version. Since Kafka provides
 	// backwards-compatibility, setting it to a version older than you have
@@ -620,6 +626,9 @@ func (c *Config) Validate() error {
 		if c.Net.SASL.Password != "" {
 			Logger.Println("Net.SASL is disabled but a non-empty password was provided.")
 		}
+	}
+	if c.Experimental.AutoVersionNegotiation && !c.ApiVersionsRequest {
+		return ConfigurationError("Experimental.AutoVersionNegotiation requires ApiVersionsRequest to be enabled")
 	}
 	if c.Producer.RequiredAcks > 1 {
 		Logger.Println("Producer.RequiredAcks > 1 is deprecated and will raise an exception with kafka >= 0.8.2.0.")
