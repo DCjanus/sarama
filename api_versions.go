@@ -1,6 +1,9 @@
 package sarama
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 type apiVersionRange struct {
 	minVersion int16
@@ -8,11 +11,6 @@ type apiVersionRange struct {
 }
 
 type apiVersionMap map[int16]*apiVersionRange
-
-type apiVersionBoundedRequest interface {
-	minVersion() int16
-	maxVersion() int16
-}
 
 // restrictApiVersion selects the appropriate API version for a given protocol body according to
 // the client and broker version ranges. By default, it selects the maximum version supported by both
@@ -36,25 +34,56 @@ func restrictApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
 }
 
 func negotiateApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
-	bounds, ok := pb.(apiVersionBoundedRequest)
-	if !ok {
-		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d does not declare client API version bounds", pb.key()))
-	}
-
 	brokerVersionRange := brokerVersions[pb.key()]
 	if brokerVersionRange == nil {
 		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d requires a broker ApiVersions response", pb.key()))
 	}
 
-	minVersion := max(bounds.minVersion(), brokerVersionRange.minVersion)
-	maxVersion := min(bounds.maxVersion(), brokerVersionRange.maxVersion)
+	clientMinVersion, clientMaxVersion, ok := supportedApiVersionRange(pb)
+	if !ok {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d has no supported client API versions", pb.key()))
+	}
+
+	minVersion := max(clientMinVersion, brokerVersionRange.minVersion)
+	maxVersion := min(clientMaxVersion, brokerVersionRange.maxVersion)
 	if minVersion > maxVersion {
 		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d has no usable version in client range [%d,%d] and broker range [%d,%d]",
-			pb.key(), bounds.minVersion(), bounds.maxVersion(), brokerVersionRange.minVersion, brokerVersionRange.maxVersion))
+			pb.key(), clientMinVersion, clientMaxVersion, brokerVersionRange.minVersion, brokerVersionRange.maxVersion))
 	}
 
 	pb.setVersion(maxVersion)
 	return nil
+}
+
+func supportedApiVersionRange(pb protocolBody) (int16, int16, bool) {
+	originalVersion := pb.version()
+	defer pb.setVersion(originalVersion)
+
+	var (
+		minVersion int16
+		maxVersion int16
+		found      bool
+	)
+	for version := int16(0); ; version++ {
+		pb.setVersion(version)
+		if !pb.isValidVersion() {
+			if found {
+				return minVersion, maxVersion, true
+			}
+			if version == math.MaxInt16 {
+				return 0, 0, false
+			}
+			continue
+		}
+		if !found {
+			minVersion = version
+			found = true
+		}
+		maxVersion = version
+		if version == math.MaxInt16 {
+			return minVersion, maxVersion, true
+		}
+	}
 }
 
 func (c *Config) versionForRequest(apiKey int16) KafkaVersion {

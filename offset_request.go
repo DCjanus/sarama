@@ -177,14 +177,6 @@ func (r *OffsetRequest) version() int16 {
 	return r.Version
 }
 
-func (r *OffsetRequest) minVersion() int16 {
-	return 0
-}
-
-func (r *OffsetRequest) maxVersion() int16 {
-	return 5
-}
-
 func (r *OffsetRequest) headerVersion() int16 {
 	return 1
 }
