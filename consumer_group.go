@@ -85,6 +85,7 @@ type consumerGroup struct {
 	groupID         string
 	groupInstanceId *string
 	memberID        string
+	generationID    int32
 	errors          chan error
 
 	lock       sync.Mutex
@@ -93,6 +94,8 @@ type consumerGroup struct {
 	closeOnce  sync.Once
 
 	userData []byte
+
+	ownedPartitions map[string][]int32
 
 	metricRegistry metrics.Registry
 }
@@ -136,14 +139,15 @@ func newConsumerGroup(groupID string, client Client) (ConsumerGroup, error) {
 	}
 
 	cg := &consumerGroup{
-		client:         client,
-		consumer:       consumer,
-		config:         config,
-		groupID:        groupID,
-		errors:         make(chan error, config.ChannelBufferSize),
-		closed:         make(chan none),
-		userData:       config.Consumer.Group.Member.UserData,
-		metricRegistry: newCleanupRegistry(config.MetricRegistry),
+		client:          client,
+		consumer:        consumer,
+		config:          config,
+		groupID:         groupID,
+		errors:          make(chan error, config.ChannelBufferSize),
+		closed:          make(chan none),
+		userData:        config.Consumer.Group.Member.UserData,
+		ownedPartitions: make(map[string][]int32),
+		metricRegistry:  newCleanupRegistry(config.MetricRegistry),
 	}
 	if config.Consumer.Group.InstanceId != "" && config.Version.IsAtLeast(V2_3_0_0) {
 		cg.groupInstanceId = &config.Consumer.Group.InstanceId
@@ -388,6 +392,7 @@ func (c *consumerGroup) newSession(ctx context.Context, topics []string, handler
 
 	switch syncGroupResponse.Err {
 	case ErrNoError:
+		c.generationID = join.GenerationId
 	case ErrUnknownMemberId, ErrIllegalGeneration:
 		// reset member ID and retry immediately
 		c.memberID = ""
@@ -499,25 +504,53 @@ func (c *consumerGroup) joinGroupRequest(coordinator *Broker, topics []string) (
 // to obtain per-cycle UserData; on error the statically configured
 // Consumer.Group.Member.UserData is used and the error is logged.
 func (c *consumerGroup) subscriptionMetadata(strategy BalanceStrategy, topics []string) *ConsumerGroupMemberMetadata {
+	metadata := &ConsumerGroupMemberMetadata{
+		Topics:   topics,
+		UserData: c.userData,
+	}
+	if isCooperativeBalanceStrategy(strategy) {
+		metadata.Version = 2
+		metadata.OwnedPartitions = ownedPartitionsMetadata(c.ownedPartitions)
+		metadata.GenerationID = c.generationID
+	}
+
 	if p, ok := strategy.(SubscriptionUserDataBalanceStrategy); ok {
 		// Hand the provider a throwaway copy so it cannot mutate the slice
 		// we later attach to the JoinGroup request.
 		userData, err := p.SubscriptionUserData(slices.Clone(topics))
 		if err == nil {
-			return &ConsumerGroupMemberMetadata{
-				Topics:   topics,
-				UserData: userData,
-			}
+			metadata.UserData = userData
+			return metadata
 		}
 		Logger.Printf(
 			"consumergroup/%s: falling back to static user data for strategy %q due to %v\n",
 			c.groupID, strategy.Name(), err,
 		)
 	}
-	return &ConsumerGroupMemberMetadata{
-		Topics:   topics,
-		UserData: c.userData,
+	return metadata
+}
+
+func ownedPartitionsMetadata(partitions map[string][]int32) []*OwnedPartition {
+	if len(partitions) == 0 {
+		return nil
 	}
+
+	topics := make([]string, 0, len(partitions))
+	for topic := range partitions {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+
+	owned := make([]*OwnedPartition, 0, len(topics))
+	for _, topic := range topics {
+		topicPartitions := slices.Clone(partitions[topic])
+		sort.Sort(int32Slice(topicPartitions))
+		owned = append(owned, &OwnedPartition{
+			Topic:      topic,
+			Partitions: topicPartitions,
+		})
+	}
+	return owned
 }
 
 // findStrategy returns the BalanceStrategy with the specified protocolName
