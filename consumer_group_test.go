@@ -40,6 +40,29 @@ func TestNewConsumerGroupFromClient(t *testing.T) {
 	})
 }
 
+func TestConsumerGroupCooperativeSubscriptionMetadata(t *testing.T) {
+	group := &consumerGroup{
+		groupID:      "my-group",
+		generationID: 4,
+		userData:     []byte("static-user-data"),
+		ownedPartitions: map[string][]int32{
+			"topic-b": {2, 1},
+			"topic-a": {0},
+		},
+	}
+
+	metadata := group.subscriptionMetadata(NewBalanceStrategyCooperativeSticky(), []string{"topic-a", "topic-b"})
+
+	assert.Equal(t, int16(2), metadata.Version)
+	assert.Equal(t, []string{"topic-a", "topic-b"}, metadata.Topics)
+	assert.Equal(t, []byte("static-user-data"), metadata.UserData)
+	assert.Equal(t, int32(4), metadata.GenerationID)
+	assert.Equal(t, []*OwnedPartition{
+		{Topic: "topic-a", Partitions: []int32{0}},
+		{Topic: "topic-b", Partitions: []int32{1, 2}},
+	}, metadata.OwnedPartitions)
+}
+
 // TestConsumerGroupNewSessionDuringOffsetLoad ensures that the consumer group
 // will retry Join and Sync group operations, if it receives a temporary
 // OffsetsLoadInProgress error response, in the same way as it would for a
