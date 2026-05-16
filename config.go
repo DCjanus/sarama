@@ -531,6 +531,8 @@ type Config struct {
 	// will not break anything, although it may prevent you from using the
 	// latest features. Setting it to a version greater than you are actually
 	// running may lead to random breakage.
+	// Set to AutoVersion to use the newest protocol versions supported by
+	// both Sarama and the broker. AutoVersion requires ApiVersionsRequest.
 	Version KafkaVersion
 	// The registry to define metrics into.
 	// Defaults to a local registry.
@@ -742,6 +744,11 @@ func (c *Config) Validate() error {
 	switch {
 	case c.Admin.Timeout <= 0:
 		return ConfigurationError("Admin.Timeout must be > 0")
+	}
+
+	// validate the version negotiation values
+	if c.Version.isAuto() && !c.ApiVersionsRequest {
+		return ConfigurationError("AutoVersion requires ApiVersionsRequest to be enabled")
 	}
 
 	// validate the Metadata values

@@ -1,6 +1,9 @@
 package sarama
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestRestrictApiVersionLowersVersionToBrokerMax(t *testing.T) {
 	request := NewMetadataRequest(V2_8_0_0, []string{"test-topic"})
@@ -93,5 +96,44 @@ func TestRestrictApiVersionDoesNothingIfBrokerVersionRangeMissing(t *testing.T) 
 
 	if request.version() != originalVersion {
 		t.Errorf("Expected version to remain %d, got %d", originalVersion, request.version())
+	}
+}
+
+func TestAutoVersionUsesClientMaxBeforeBrokerClamp(t *testing.T) {
+	request := NewMetadataRequest(AutoVersion, []string{"test-topic"})
+
+	if request.version() != 10 {
+		t.Errorf("Expected AutoVersion to select client max 10, got %d", request.version())
+	}
+
+	brokerVersions := apiVersionMap{
+		apiKeyMetadata: &apiVersionRange{
+			minVersion: 0,
+			maxVersion: 8,
+		},
+	}
+
+	if err := restrictApiVersion(request, brokerVersions); err != nil {
+		t.Errorf("restrictApiVersion returned unexpected error: %v", err)
+	}
+
+	if request.version() != 8 {
+		t.Errorf("Expected AutoVersion request to be restricted to 8, got %d", request.version())
+	}
+}
+
+func TestAutoVersionRequiresBrokerApiVersions(t *testing.T) {
+	config := NewConfig()
+	config.Version = AutoVersion
+
+	broker := &Broker{conf: config}
+	request := NewMetadataRequest(AutoVersion, []string{"test-topic"})
+
+	err := broker.sendInternal(request, nil)
+	if err == nil {
+		t.Fatal("Expected sendInternal to reject AutoVersion without broker ApiVersions")
+	}
+	if !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("Expected ErrUnsupportedVersion, got %v", err)
 	}
 }
