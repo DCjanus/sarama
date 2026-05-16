@@ -21,6 +21,9 @@ const (
 	// StickyBalanceStrategyName identifies strategies that use the sticky-partition assignment strategy
 	StickyBalanceStrategyName = "sticky"
 
+	// CooperativeStickyBalanceStrategyName identifies strategies that use the cooperative sticky-partition assignment strategy.
+	CooperativeStickyBalanceStrategyName = "cooperative-sticky"
+
 	defaultGeneration = -1
 )
 
@@ -129,11 +132,17 @@ var BalanceStrategyRange = NewBalanceStrategyRange()
 //	M2: {T: [1, 3]}
 //	M3: {T: [4, 5]}
 func NewBalanceStrategySticky() BalanceStrategy {
-	return &stickyBalanceStrategy{}
+	return &stickyBalanceStrategy{name: StickyBalanceStrategyName}
 }
 
 // Deprecated: use NewBalanceStrategySticky to avoid data race issue
 var BalanceStrategySticky = NewBalanceStrategySticky()
+
+// NewBalanceStrategyCooperativeSticky returns a cooperative sticky balance strategy,
+// which incrementally revokes partitions before assigning them to new owners.
+func NewBalanceStrategyCooperativeSticky() BalanceStrategy {
+	return &stickyBalanceStrategy{name: CooperativeStickyBalanceStrategyName, cooperative: true}
+}
 
 // --------------------------------------------------------------------
 
@@ -186,11 +195,18 @@ func (s *balanceStrategy) AssignmentData(memberID string, topics map[string][]in
 }
 
 type stickyBalanceStrategy struct {
-	movements partitionMovements
+	movements   partitionMovements
+	name        string
+	cooperative bool
 }
 
 // Name implements BalanceStrategy.
-func (s *stickyBalanceStrategy) Name() string { return StickyBalanceStrategyName }
+func (s *stickyBalanceStrategy) Name() string {
+	if s.name == "" {
+		return StickyBalanceStrategyName
+	}
+	return s.name
+}
 
 // Plan implements BalanceStrategy.
 func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetadata, topics map[string][]int32) (BalanceStrategyPlan, error) {
@@ -201,7 +217,7 @@ func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetad
 	}
 
 	// prepopulate the current assignment state from userdata on the consumer group members
-	currentAssignment, prevAssignment, err := prepopulateCurrentAssignments(members)
+	currentAssignment, prevAssignment, err := prepopulateCurrentAssignments(members, s.cooperative)
 	if err != nil {
 		return nil, err
 	}
@@ -280,6 +296,10 @@ func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetad
 	sortedCurrentSubscriptions := sortMemberIDsByPartitionAssignments(currentAssignment)
 	s.balance(currentAssignment, prevAssignment, sortedPartitions, unassignedPartitions, sortedCurrentSubscriptions, consumer2AllPotentialPartitions, partition2AllPotentialConsumers, currentPartitionConsumers)
 
+	if s.cooperative {
+		currentAssignment = removePartitionsTransferringOwnership(members, currentAssignment)
+	}
+
 	// Assemble plan
 	plan := make(BalanceStrategyPlan, len(currentAssignment))
 	for memberID, assignments := range currentAssignment {
@@ -297,10 +317,43 @@ func (s *stickyBalanceStrategy) Plan(members map[string]ConsumerGroupMemberMetad
 // AssignmentData serializes the set of topics currently assigned to the
 // specified member as part of the supplied balance plan
 func (s *stickyBalanceStrategy) AssignmentData(memberID string, topics map[string][]int32, generationID int32) ([]byte, error) {
+	if s.cooperative {
+		return encode(&cooperativeStickyAssignorUserDataV0{
+			Generation: generationID,
+		}, nil)
+	}
 	return encode(&StickyAssignorUserDataV1{
 		Topics:     topics,
 		Generation: generationID,
 	}, nil)
+}
+
+func isCooperativeBalanceStrategy(strategy BalanceStrategy) bool {
+	sticky, ok := strategy.(*stickyBalanceStrategy)
+	return ok && sticky.cooperative
+}
+
+func removePartitionsTransferringOwnership(members map[string]ConsumerGroupMemberMetadata, currentAssignment map[string][]topicPartitionAssignment) map[string][]topicPartitionAssignment {
+	previousOwners := make(map[topicPartitionAssignment]string)
+	for memberID, metadata := range members {
+		for _, ownedPartitions := range metadata.OwnedPartitions {
+			for _, partition := range ownedPartitions.Partitions {
+				previousOwners[topicPartitionAssignment{Topic: ownedPartitions.Topic, Partition: partition}] = memberID
+			}
+		}
+	}
+	if len(previousOwners) == 0 {
+		return currentAssignment
+	}
+
+	for memberID, assignments := range currentAssignment {
+		assignments = slices.DeleteFunc(assignments, func(assignment topicPartitionAssignment) bool {
+			previousOwner, ok := previousOwners[assignment]
+			return ok && previousOwner != memberID
+		})
+		currentAssignment[memberID] = assignments
+	}
+	return currentAssignment
 }
 
 // Balance assignments across consumers for maximum fairness and stickiness.
@@ -639,6 +692,27 @@ func deserializeTopicPartitionAssignment(userDataBytes []byte) (StickyAssignorUs
 	return userDataV1, nil
 }
 
+func deserializeMemberAssignment(metadata ConsumerGroupMemberMetadata, cooperative bool) (StickyAssignorUserData, error) {
+	if !cooperative {
+		return deserializeTopicPartitionAssignment(metadata.UserData)
+	}
+
+	memberData := &cooperativeStickyMemberData{
+		topicPartitions: populateTopicPartitionsFromOwned(metadata.OwnedPartitions),
+		Generation:      metadata.GenerationID,
+	}
+	if metadata.Version >= 2 {
+		return memberData, nil
+	}
+
+	userData := &cooperativeStickyAssignorUserDataV0{}
+	if err := decode(metadata.UserData, userData, nil); err != nil {
+		return nil, err
+	}
+	memberData.Generation = userData.Generation
+	return memberData, nil
+}
+
 // filterAssignedPartitions returns a map of consumer group members to their list of previously-assigned topic partitions, limited
 // to those topic partitions currently reported by the Kafka cluster.
 func filterAssignedPartitions(currentAssignment map[string][]topicPartitionAssignment, partition2AllPotentialConsumers map[topicPartitionAssignment][]string) map[string][]topicPartitionAssignment {
@@ -835,14 +909,14 @@ func areSubscriptionsIdentical(partition2AllPotentialConsumers map[topicPartitio
 // We need to process subscriptions' user data with each consumer's reported generation in mind
 // higher generations overwrite lower generations in case of a conflict
 // note that a conflict could exist only if user data is for different generations
-func prepopulateCurrentAssignments(members map[string]ConsumerGroupMemberMetadata) (map[string][]topicPartitionAssignment, map[topicPartitionAssignment]consumerGenerationPair, error) {
+func prepopulateCurrentAssignments(members map[string]ConsumerGroupMemberMetadata, cooperative bool) (map[string][]topicPartitionAssignment, map[topicPartitionAssignment]consumerGenerationPair, error) {
 	currentAssignment := make(map[string][]topicPartitionAssignment)
 	prevAssignment := make(map[topicPartitionAssignment]consumerGenerationPair)
 
 	// for each partition we create a sorted map of its consumers by generation
 	sortedPartitionConsumersByGeneration := make(map[topicPartitionAssignment]map[int]string)
 	for memberID, meta := range members {
-		consumerUserData, err := deserializeTopicPartitionAssignment(meta.UserData)
+		consumerUserData, err := deserializeMemberAssignment(meta, cooperative)
 		if err != nil {
 			return nil, nil, err
 		}

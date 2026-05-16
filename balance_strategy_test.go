@@ -444,7 +444,7 @@ func Test_prepopulateCurrentAssignments(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, gotPrevAssignments, err := prepopulateCurrentAssignments(tt.args.members)
+			_, gotPrevAssignments, err := prepopulateCurrentAssignments(tt.args.members, false)
 
 			if (err != nil) != tt.wantErr {
 				t.Errorf("prepopulateCurrentAssignments() error = %v, wantErr %v", err, tt.wantErr)
@@ -1347,6 +1347,60 @@ func Test_stickyBalanceStrategy_Plan(t *testing.T) {
 	}
 }
 
+func TestCooperativeStickyBalanceStrategyDoesNotTransferOwnedPartitions(t *testing.T) {
+	strategy := NewBalanceStrategyCooperativeSticky()
+	if strategy.Name() != CooperativeStickyBalanceStrategyName {
+		t.Fatalf("expected cooperative sticky strategy name, got %q", strategy.Name())
+	}
+
+	members := map[string]ConsumerGroupMemberMetadata{
+		"consumer1": {
+			Version: 2,
+			Topics:  []string{"topic1"},
+			OwnedPartitions: []*OwnedPartition{{
+				Topic:      "topic1",
+				Partitions: []int32{0, 1},
+			}},
+			GenerationID: 1,
+		},
+		"consumer2": {
+			Version: 2,
+			Topics:  []string{"topic1"},
+			OwnedPartitions: []*OwnedPartition{{
+				Topic:      "topic1",
+				Partitions: []int32{2, 3},
+			}},
+			GenerationID: 1,
+		},
+		"consumer3": {
+			Version:      2,
+			Topics:       []string{"topic1"},
+			GenerationID: 1,
+		},
+	}
+	topics := map[string][]int32{"topic1": {0, 1, 2, 3}}
+
+	plan, err := strategy.Plan(members, topics)
+	if err != nil {
+		t.Fatalf("cooperative sticky plan failed: %v", err)
+	}
+	verifyValidityAndBalance(t, members, plan)
+
+	previousOwners := map[topicPartitionAssignment]string{
+		{Topic: "topic1", Partition: 0}: "consumer1",
+		{Topic: "topic1", Partition: 1}: "consumer1",
+		{Topic: "topic1", Partition: 2}: "consumer2",
+		{Topic: "topic1", Partition: 3}: "consumer2",
+	}
+	for memberID, assignments := range flattenPlan(plan) {
+		for _, assignment := range assignments {
+			if previousOwner, ok := previousOwners[assignment]; ok && previousOwner != memberID {
+				t.Fatalf("partition %v was assigned to %s before %s revoked it", assignment, memberID, previousOwner)
+			}
+		}
+	}
+}
+
 func Test_stickyBalanceStrategy_Plan_KIP54_ExampleOne(t *testing.T) {
 	s := &stickyBalanceStrategy{}
 
@@ -2182,6 +2236,18 @@ func verifyPlanIsBalancedAndSticky(t *testing.T, s *stickyBalanceStrategy, membe
 		return
 	}
 	verifyValidityAndBalance(t, members, plan)
+}
+
+func flattenPlan(plan BalanceStrategyPlan) map[string][]topicPartitionAssignment {
+	assignments := make(map[string][]topicPartitionAssignment, len(plan))
+	for memberID, topics := range plan {
+		for topic, partitions := range topics {
+			for _, partition := range partitions {
+				assignments[memberID] = append(assignments[memberID], topicPartitionAssignment{Topic: topic, Partition: partition})
+			}
+		}
+	}
+	return assignments
 }
 
 func verifyValidityAndBalance(t *testing.T, consumers map[string]ConsumerGroupMemberMetadata, plan BalanceStrategyPlan) {
