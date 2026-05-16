@@ -95,3 +95,89 @@ func TestRestrictApiVersionDoesNothingIfBrokerVersionRangeMissing(t *testing.T) 
 		t.Errorf("Expected version to remain %d, got %d", originalVersion, request.version())
 	}
 }
+
+func TestNegotiateApiVersionSelectsLatestUsableVersion(t *testing.T) {
+	request := NewMetadataRequest(MaxVersion, []string{"test-topic"})
+
+	if request.version() != 10 {
+		t.Errorf("Expected MetadataRequest version to start at client max 10, got %d", request.version())
+	}
+
+	brokerVersions := apiVersionMap{
+		apiKeyMetadata: &apiVersionRange{
+			minVersion: 0,
+			maxVersion: 8,
+		},
+	}
+
+	if err := negotiateApiVersion(request, brokerVersions); err != nil {
+		t.Fatalf("negotiateApiVersion returned unexpected error: %v", err)
+	}
+
+	if request.version() != 8 {
+		t.Errorf("Expected negotiated version 8, got %d", request.version())
+	}
+}
+
+func TestNegotiateApiVersionRejectsMissingBrokerRange(t *testing.T) {
+	request := NewMetadataRequest(MaxVersion, []string{"test-topic"})
+
+	if err := negotiateApiVersion(request, apiVersionMap{}); err == nil {
+		t.Fatal("Expected negotiateApiVersion to reject a missing broker range")
+	}
+}
+
+func TestNegotiateApiVersionRejectsNoOverlap(t *testing.T) {
+	request := NewMetadataRequest(MaxVersion, []string{"test-topic"})
+
+	brokerVersions := apiVersionMap{
+		apiKeyMetadata: &apiVersionRange{
+			minVersion: 11,
+			maxVersion: 12,
+		},
+	}
+
+	if err := negotiateApiVersion(request, brokerVersions); err == nil {
+		t.Fatal("Expected negotiateApiVersion to reject non-overlapping ranges")
+	}
+}
+
+func TestExperimentalVersionForRequestUsesClientMaxForMigratedAPIs(t *testing.T) {
+	config := NewConfig()
+	config.Experimental.AutoVersionNegotiation = true
+
+	metadataRequest := NewMetadataRequest(config.versionForRequest(apiKeyMetadata), []string{"test-topic"})
+	if metadataRequest.version() != 10 {
+		t.Errorf("Expected MetadataRequest to use client max 10, got %d", metadataRequest.version())
+	}
+
+	offsetRequest := NewOffsetRequest(config.versionForRequest(apiKeyListOffsets))
+	if offsetRequest.version() != 5 {
+		t.Errorf("Expected OffsetRequest to use client max 5, got %d", offsetRequest.version())
+	}
+}
+
+func TestExperimentalAutoVersionNegotiationRequiresRequestOptIn(t *testing.T) {
+	config := NewConfig()
+	config.Experimental.AutoVersionNegotiation = true
+
+	request := NewMetadataRequest(config.versionForRequest(apiKeyMetadata), []string{"test-topic"})
+	if config.autoVersionNegotiationEnabled(request) {
+		t.Fatal("Expected request-level auto negotiation to be disabled before opt-in")
+	}
+
+	config.enableAutoVersionNegotiation(request)
+	if !config.autoVersionNegotiationEnabled(request) {
+		t.Fatal("Expected request-level auto negotiation to be enabled after opt-in")
+	}
+}
+
+func TestExperimentalVersionForRequestLeavesUnmigratedAPIsOnConfiguredVersion(t *testing.T) {
+	config := NewConfig()
+	config.Version = V0_11_0_0
+	config.Experimental.AutoVersionNegotiation = true
+
+	if got := config.versionForRequest(apiKeyProduce); got != config.Version {
+		t.Errorf("Expected unmigrated API to use configured version %s, got %s", config.Version, got)
+	}
+}

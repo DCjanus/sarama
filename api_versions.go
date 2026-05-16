@@ -1,11 +1,24 @@
 package sarama
 
+import "fmt"
+
 type apiVersionRange struct {
 	minVersion int16
 	maxVersion int16
 }
 
 type apiVersionMap map[int16]*apiVersionRange
+
+type apiVersionBoundedRequest interface {
+	minVersion() int16
+	maxVersion() int16
+}
+
+type apiVersionNegotiableRequest interface {
+	apiVersionBoundedRequest
+	enableAutoVersionNegotiation()
+	autoVersionNegotiationEnabled() bool
+}
 
 // restrictApiVersion selects the appropriate API version for a given protocol body according to
 // the client and broker version ranges. By default, it selects the maximum version supported by both
@@ -26,6 +39,66 @@ func restrictApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
 	}
 
 	return nil // no version ranges available, no restriction
+}
+
+func negotiateApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
+	bounds, ok := pb.(apiVersionBoundedRequest)
+	if !ok {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d does not declare client API version bounds", pb.key()))
+	}
+
+	brokerVersionRange := brokerVersions[pb.key()]
+	if brokerVersionRange == nil {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d requires a broker ApiVersions response", pb.key()))
+	}
+
+	minVersion := max(bounds.minVersion(), brokerVersionRange.minVersion)
+	maxVersion := min(bounds.maxVersion(), brokerVersionRange.maxVersion)
+	if minVersion > maxVersion {
+		return Wrap(ErrUnsupportedVersion, fmt.Errorf("api key %d has no usable version in client range [%d,%d] and broker range [%d,%d]",
+			pb.key(), bounds.minVersion(), bounds.maxVersion(), brokerVersionRange.minVersion, brokerVersionRange.maxVersion))
+	}
+
+	pb.setVersion(maxVersion)
+	return nil
+}
+
+func (c *Config) versionForRequest(apiKey int16) KafkaVersion {
+	if c.experimentalAutoVersionNegotiationAPI(apiKey) {
+		return MaxVersion
+	}
+	return c.Version
+}
+
+func (c *Config) enableAutoVersionNegotiation(pb protocolBody) {
+	if !c.experimentalAutoVersionNegotiationAPI(pb.key()) {
+		return
+	}
+	request, ok := pb.(apiVersionNegotiableRequest)
+	if !ok {
+		return
+	}
+	request.enableAutoVersionNegotiation()
+}
+
+func (c *Config) autoVersionNegotiationEnabled(pb protocolBody) bool {
+	if !c.Experimental.AutoVersionNegotiation {
+		return false
+	}
+	request, ok := pb.(apiVersionNegotiableRequest)
+	return ok && request.autoVersionNegotiationEnabled()
+}
+
+func (c *Config) experimentalAutoVersionNegotiationAPI(apiKey int16) bool {
+	if !c.Experimental.AutoVersionNegotiation {
+		return false
+	}
+	switch apiKey {
+	case apiKeyListOffsets, apiKeyMetadata:
+		return true
+	default:
+		return false
+	}
 }
 
 const (
