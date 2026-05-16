@@ -14,12 +14,6 @@ type apiVersionBoundedRequest interface {
 	maxVersion() int16
 }
 
-type apiVersionNegotiableRequest interface {
-	apiVersionBoundedRequest
-	enableAutoVersionNegotiation()
-	autoVersionNegotiationEnabled() bool
-}
-
 // restrictApiVersion selects the appropriate API version for a given protocol body according to
 // the client and broker version ranges. By default, it selects the maximum version supported by both
 // client and broker, capped by the maximum Kafka version from Config.
@@ -64,32 +58,13 @@ func negotiateApiVersion(pb protocolBody, brokerVersions apiVersionMap) error {
 }
 
 func (c *Config) versionForRequest(apiKey int16) KafkaVersion {
-	if c.experimentalAutoVersionNegotiationAPI(apiKey) {
+	if c.autoVersionNegotiationEnabled(apiKey) {
 		return MaxVersion
 	}
 	return c.Version
 }
 
-func (c *Config) enableAutoVersionNegotiation(pb protocolBody) {
-	if !c.experimentalAutoVersionNegotiationAPI(pb.key()) {
-		return
-	}
-	request, ok := pb.(apiVersionNegotiableRequest)
-	if !ok {
-		return
-	}
-	request.enableAutoVersionNegotiation()
-}
-
-func (c *Config) autoVersionNegotiationEnabled(pb protocolBody) bool {
-	if !c.Experimental.AutoVersionNegotiation {
-		return false
-	}
-	request, ok := pb.(apiVersionNegotiableRequest)
-	return ok && request.autoVersionNegotiationEnabled()
-}
-
-func (c *Config) experimentalAutoVersionNegotiationAPI(apiKey int16) bool {
+func (c *Config) autoVersionNegotiationEnabled(apiKey int16) bool {
 	if !c.Experimental.AutoVersionNegotiation {
 		return false
 	}
