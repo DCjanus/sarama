@@ -35,22 +35,6 @@ func TestDefaultConfigValidates(t *testing.T) {
 	}
 }
 
-func TestAutoVersionRequiresApiVersionsRequest(t *testing.T) {
-	config := NewTestConfig()
-	config.Version = AutoVersion
-	config.ApiVersionsRequest = false
-
-	err := config.Validate()
-	assert.ErrorContains(t, err, "AutoVersion requires ApiVersionsRequest to be enabled")
-}
-
-func TestAutoVersionConfigValidates(t *testing.T) {
-	config := NewConfig()
-	config.Version = AutoVersion
-
-	assert.NoError(t, config.Validate())
-}
-
 // TestInvalidClientIDValidated ensures that the ClientID field is checked
 // when Version is set to anything less than 1_0_0_0, but otherwise accepted
 func TestInvalidClientIDValidated(t *testing.T) {

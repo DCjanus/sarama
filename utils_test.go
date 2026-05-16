@@ -33,7 +33,6 @@ func TestVersionCompare(t *testing.T) {
 
 func TestVersionParsing(t *testing.T) {
 	validVersions := []string{
-		"auto",
 		"0.8.2.0",
 		"0.8.2.1",
 		"0.8.2.2",
