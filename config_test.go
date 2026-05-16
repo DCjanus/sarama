@@ -35,6 +35,22 @@ func TestDefaultConfigValidates(t *testing.T) {
 	}
 }
 
+func TestExperimentalAutoVersionNegotiationRequiresApiVersionsRequest(t *testing.T) {
+	config := NewTestConfig()
+	config.Experimental.AutoVersionNegotiation = true
+
+	err := config.Validate()
+	assert.ErrorContains(t, err, "Experimental.AutoVersionNegotiation requires ApiVersionsRequest to be enabled")
+}
+
+func TestExperimentalAutoVersionNegotiationConfigValidates(t *testing.T) {
+	config := NewTestConfig()
+	config.ApiVersionsRequest = true
+	config.Experimental.AutoVersionNegotiation = true
+
+	assert.NoError(t, config.Validate())
+}
+
 // TestInvalidClientIDValidated ensures that the ClientID field is checked
 // when Version is set to anything less than 1_0_0_0, but otherwise accepted
 func TestInvalidClientIDValidated(t *testing.T) {

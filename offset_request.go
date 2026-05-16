@@ -45,11 +45,12 @@ func (b *offsetRequestBlock) decode(pd packetDecoder, version int16) (err error)
 }
 
 type OffsetRequest struct {
-	Version        int16
-	IsolationLevel IsolationLevel
-	replicaID      int32
-	isReplicaIDSet bool
-	blocks         map[string]map[int32]*offsetRequestBlock
+	Version                int16
+	IsolationLevel         IsolationLevel
+	replicaID              int32
+	isReplicaIDSet         bool
+	blocks                 map[string]map[int32]*offsetRequestBlock
+	autoVersionNegotiation bool
 }
 
 func NewOffsetRequest(version KafkaVersion) *OffsetRequest {
@@ -175,6 +176,22 @@ func (r *OffsetRequest) key() int16 {
 
 func (r *OffsetRequest) version() int16 {
 	return r.Version
+}
+
+func (r *OffsetRequest) minVersion() int16 {
+	return 0
+}
+
+func (r *OffsetRequest) maxVersion() int16 {
+	return 5
+}
+
+func (r *OffsetRequest) enableAutoVersionNegotiation() {
+	r.autoVersionNegotiation = true
+}
+
+func (r *OffsetRequest) autoVersionNegotiationEnabled() bool {
+	return r.autoVersionNegotiation
 }
 
 func (r *OffsetRequest) headerVersion() int16 {

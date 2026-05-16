@@ -19,6 +19,7 @@ type MetadataRequest struct {
 	AllowAutoTopicCreation             bool
 	IncludeClusterAuthorizedOperations bool // version 8 and up
 	IncludeTopicAuthorizedOperations   bool // version 8 and up
+	autoVersionNegotiation             bool
 }
 
 func (r *MetadataRequest) setVersion(v int16) {
@@ -162,6 +163,22 @@ func (r *MetadataRequest) key() int16 {
 
 func (r *MetadataRequest) version() int16 {
 	return r.Version
+}
+
+func (r *MetadataRequest) minVersion() int16 {
+	return 0
+}
+
+func (r *MetadataRequest) maxVersion() int16 {
+	return 10
+}
+
+func (r *MetadataRequest) enableAutoVersionNegotiation() {
+	r.autoVersionNegotiation = true
+}
+
+func (r *MetadataRequest) autoVersionNegotiationEnabled() bool {
+	return r.autoVersionNegotiation
 }
 
 func (r *MetadataRequest) headerVersion() int16 {
