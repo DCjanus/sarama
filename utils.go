@@ -306,12 +306,6 @@ var (
 	DefaultVersion = V2_1_0_0
 )
 
-// AutoVersion makes Sarama select the newest protocol versions supported by
-// both Sarama and each broker's ApiVersionsResponse.
-var AutoVersion = KafkaVersion{
-	version: [4]uint{^uint(0), ^uint(0), ^uint(0), ^uint(0)},
-}
-
 var (
 	// This regex validates that a string complies with the pre kafka 1.0.0 format for version strings, for example 0.11.0.3
 	validPreKafka1Version = regexp.MustCompile(`^0\.\d+\.\d+\.\d+$`)
@@ -322,9 +316,6 @@ var (
 
 // ParseKafkaVersion parses and returns kafka version or error from a string
 func ParseKafkaVersion(s string) (KafkaVersion, error) {
-	if s == "auto" {
-		return AutoVersion, nil
-	}
 	if len(s) < 5 {
 		return DefaultVersion, fmt.Errorf("invalid version `%s`", s)
 	}
@@ -349,14 +340,7 @@ func scanKafkaVersion(s string, pattern *regexp.Regexp, format string, v [3]*uin
 	return err
 }
 
-func (v KafkaVersion) isAuto() bool {
-	return v == AutoVersion
-}
-
 func (v KafkaVersion) String() string {
-	if v.isAuto() {
-		return "auto"
-	}
 	if v.version[0] == 0 {
 		return fmt.Sprintf("0.%d.%d.%d", v.version[1], v.version[2], v.version[3])
 	}
