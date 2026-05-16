@@ -113,11 +113,47 @@ func (m *StickyAssignorUserDataV1) partitions() []topicPartitionAssignment { ret
 func (m *StickyAssignorUserDataV1) hasGeneration() bool                    { return true }
 func (m *StickyAssignorUserDataV1) generation() int                        { return int(m.Generation) }
 
+type cooperativeStickyAssignorUserDataV0 struct {
+	Generation int32
+}
+
+func (m *cooperativeStickyAssignorUserDataV0) encode(pe packetEncoder) error {
+	pe.putInt32(m.Generation)
+	return nil
+}
+
+func (m *cooperativeStickyAssignorUserDataV0) decode(pd packetDecoder) (err error) {
+	m.Generation, err = pd.getInt32()
+	return err
+}
+
+type cooperativeStickyMemberData struct {
+	topicPartitions []topicPartitionAssignment
+	Generation      int32
+}
+
+func (m *cooperativeStickyMemberData) partitions() []topicPartitionAssignment {
+	return m.topicPartitions
+}
+
+func (m *cooperativeStickyMemberData) hasGeneration() bool { return true }
+func (m *cooperativeStickyMemberData) generation() int     { return int(m.Generation) }
+
 func populateTopicPartitions(topics map[string][]int32) []topicPartitionAssignment {
 	topicPartitions := make([]topicPartitionAssignment, 0)
 	for topic, partitions := range topics {
 		for _, partition := range partitions {
 			topicPartitions = append(topicPartitions, topicPartitionAssignment{Topic: topic, Partition: partition})
+		}
+	}
+	return topicPartitions
+}
+
+func populateTopicPartitionsFromOwned(ownedPartitions []*OwnedPartition) []topicPartitionAssignment {
+	topicPartitions := make([]topicPartitionAssignment, 0)
+	for _, owned := range ownedPartitions {
+		for _, partition := range owned.Partitions {
+			topicPartitions = append(topicPartitions, topicPartitionAssignment{Topic: owned.Topic, Partition: partition})
 		}
 	}
 	return topicPartitions
