@@ -880,6 +880,27 @@ func TestClientCheckBrokersHealth(t *testing.T) {
 			assert.False(c, connected)
 		}, time.Second, 10*time.Millisecond)
 	})
+
+	t.Run("client close closes dead seed brokers", func(t *testing.T) {
+		broker, _, cleanup := newConnectedBroker(t)
+		defer cleanup()
+
+		client := &client{
+			closer:    make(chan none),
+			closed:    make(chan none),
+			brokers:   map[int32]*Broker{},
+			deadSeeds: []*Broker{broker},
+		}
+		close(client.closed)
+
+		require.NoError(t, client.Close())
+
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			connected, err := broker.Connected()
+			assert.NoError(c, err)
+			assert.False(c, connected)
+		}, time.Second, 10*time.Millisecond)
+	})
 }
 
 //nolint:paralleltest

@@ -333,7 +333,13 @@ func (client *client) Close() error {
 		safeAsyncClose(broker)
 	}
 
+	for _, broker := range client.deadSeeds {
+		safeAsyncClose(broker)
+	}
+
 	client.brokers = nil
+	client.seedBrokers = nil
+	client.deadSeeds = nil
 	client.metadata = nil
 	client.metadataTopics = nil
 
