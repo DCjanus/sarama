@@ -577,11 +577,16 @@ func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 // Fetch returns a FetchResponse or error
 func (b *Broker) Fetch(request *FetchRequest) (*FetchResponse, error) {
 	defer func() {
-		if b.fetchRate != nil {
-			b.fetchRate.Mark(1)
+		b.lock.Lock()
+		fetchRate := b.fetchRate
+		brokerFetchRate := b.brokerFetchRate
+		b.lock.Unlock()
+
+		if fetchRate != nil {
+			fetchRate.Mark(1)
 		}
-		if b.brokerFetchRate != nil {
-			b.brokerFetchRate.Mark(1)
+		if brokerFetchRate != nil {
+			brokerFetchRate.Mark(1)
 		}
 	}()
 
