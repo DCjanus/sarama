@@ -886,6 +886,10 @@ func TestClientCheckBrokersHealth(t *testing.T) {
 			t.Skip("socket error probing is unavailable on this platform")
 		}
 
+		// Regression coverage for the idle TCP connection leaks reported in
+		// https://redirect.github.com/IBM/sarama/issues/3143. The broken
+		// seed connection is not used for this refresh, so it is only cleaned
+		// up if metadata refresh probes existing broker socket health.
 		seedBroker := NewMockBroker(t, 1)
 		defer seedBroker.Close()
 
