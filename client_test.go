@@ -881,22 +881,40 @@ func TestClientCheckBrokersHealth(t *testing.T) {
 		}, time.Second, 10*time.Millisecond)
 	})
 
-	t.Run("client close closes dead seed brokers", func(t *testing.T) {
-		broker, _, cleanup := newConnectedBroker(t)
+	t.Run("metadata refresh closes idle unhealthy seed brokers", func(t *testing.T) {
+		if !socketErrorProbeAvailable() {
+			t.Skip("socket error probing is unavailable on this platform")
+		}
+
+		seedBroker := NewMockBroker(t, 1)
+		defer seedBroker.Close()
+
+		metadataResponse := new(MetadataResponse)
+		metadataResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
+		seedBroker.Returns(metadataResponse)
+
+		conf := NewTestConfig()
+		conf.Metadata.RefreshFrequency = 0
+		c, err := NewClient([]string{seedBroker.Addr()}, conf)
+		require.NoError(t, err)
+		defer safeClose(t, c)
+
+		badBroker, serverConn, cleanup := newConnectedBroker(t)
 		defer cleanup()
 
-		client := &client{
-			closer:    make(chan none),
-			closed:    make(chan none),
-			brokers:   map[int32]*Broker{},
-			deadSeeds: []*Broker{broker},
-		}
-		close(client.closed)
+		client := c.(*client)
+		client.lock.Lock()
+		client.seedBrokers = append(client.seedBrokers, badBroker)
+		client.lock.Unlock()
 
-		require.NoError(t, client.Close())
+		require.NoError(t, serverConn.SetLinger(0))
+		require.NoError(t, serverConn.Close())
+
+		seedBroker.Returns(metadataResponse)
+		require.NoError(t, client.RefreshMetadata())
 
 		require.EventuallyWithT(t, func(c *assert.CollectT) {
-			connected, err := broker.Connected()
+			connected, err := badBroker.Connected()
 			assert.NoError(c, err)
 			assert.False(c, connected)
 		}, time.Second, 10*time.Millisecond)
