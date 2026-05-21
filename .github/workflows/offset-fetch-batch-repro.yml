@@ -4,6 +4,8 @@ on:
     branches:
     - "**"
     paths:
+    - admin.go
+    - broker.go
     - functional_admin_test.go
     - .github/workflows/offset-fetch-batch-repro.yml
 
