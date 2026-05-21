@@ -34,7 +34,7 @@ func TestBrokerConcurrentOpenAndFetchDoesNotRace(t *testing.T) {
 
 	var stopFetchers atomic.Bool
 	var fetchers sync.WaitGroup
-	for range 4 {
+	for range 10 {
 		fetchers.Add(1)
 		go func() {
 			defer fetchers.Done()
