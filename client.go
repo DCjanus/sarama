@@ -943,6 +943,10 @@ func (client *client) backgroundMetadataUpdater() {
 		select {
 		case <-ticker.C:
 			if err := client.refreshMetadata(); err != nil {
+				// expected no-op, not worth logging every tick
+				if errors.Is(err, ErrNoTopicsToUpdateMetadata) {
+					continue
+				}
 				Logger.Println("Client background metadata update:", err)
 			}
 		case <-client.closer:
@@ -1077,9 +1081,9 @@ func (client *client) tryRefreshMetadata(topics []string, attemptsRemaining int,
 }
 
 // if no fatal error, returns a list of topics that need retrying due to ErrLeaderNotAvailable
-func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bool) (retry bool, err error) {
+func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bool) (bool, error) {
 	if client.Closed() {
-		return
+		return false, nil
 	}
 
 	client.lock.Lock()
@@ -1107,6 +1111,8 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		client.metadataTopics = make(map[string]none)
 		client.cachedPartitionsResults = make(map[string][maxPartitionIndex][]int32)
 	}
+	topicErrs := make(refreshError)
+	retry := false
 	for _, topic := range data.Topics {
 		// topics must be added firstly to `metadataTopics` to guarantee that all
 		// requested topics must be recorded to keep them trackable for periodically
@@ -1121,18 +1127,18 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		case ErrNoError:
 			// no-op
 		case ErrInvalidTopic, ErrTopicAuthorizationFailed: // don't retry, don't store partial results
-			err = topic.Err
+			topicErrs.addError(topic.Name, topic.Err)
 			continue
 		case ErrUnknownTopicOrPartition: // retry, do not store partial partition results
-			err = topic.Err
+			topicErrs.addError(topic.Name, topic.Err)
 			retry = true
 			continue
 		case ErrLeaderNotAvailable: // retry, but store partial partition results
-			err = topic.Err
+			topicErrs.addError(topic.Name, topic.Err)
 			retry = true
 		default: // don't retry, don't store partial results
 			Logger.Printf("Unexpected topic-level metadata error: %s", topic.Err)
-			err = topic.Err
+			topicErrs.addError(topic.Name, topic.Err)
 			continue
 		}
 
@@ -1140,7 +1146,7 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		for _, partition := range topic.Partitions {
 			client.metadata[topic.Name][partition.ID] = partition
 			if errors.Is(partition.Err, ErrLeaderNotAvailable) {
-				err = partition.Err
+				topicErrs.addError(topic.Name, partition.Err)
 				retry = true
 			}
 		}
@@ -1151,7 +1157,10 @@ func (client *client) updateMetadata(data *MetadataResponse, allKnownMetaData bo
 		client.cachedPartitionsResults[topic.Name] = partitionCache
 	}
 
-	return
+	if len(topicErrs) == 0 {
+		return retry, nil
+	}
+	return retry, topicErrs
 }
 
 func (client *client) cachedCoordinator(consumerGroup string) *Broker {
@@ -1215,6 +1224,10 @@ func (client *client) findCoordinator(coordinatorKey string, coordinatorType Coo
 		// Version 2 is the same as version 1.
 		if client.conf.Version.IsAtLeast(V2_0_0_0) {
 			request.Version = 2
+		}
+		// Version 3 is the first flexible version
+		if client.conf.Version.IsAtLeast(V2_4_0_0) {
+			request.Version = 3
 		}
 
 		response, err := broker.FindCoordinator(request)

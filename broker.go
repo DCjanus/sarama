@@ -577,11 +577,16 @@ func (b *Broker) Produce(request *ProduceRequest) (*ProduceResponse, error) {
 // Fetch returns a FetchResponse or error
 func (b *Broker) Fetch(request *FetchRequest) (*FetchResponse, error) {
 	defer func() {
-		if b.fetchRate != nil {
-			b.fetchRate.Mark(1)
+		// snapshot meters under the lock; Open may reassign them on reconnect
+		b.lock.Lock()
+		fetchRate, brokerFetchRate := b.fetchRate, b.brokerFetchRate
+		b.lock.Unlock()
+
+		if fetchRate != nil {
+			fetchRate.Mark(1)
 		}
-		if b.brokerFetchRate != nil {
-			b.brokerFetchRate.Mark(1)
+		if brokerFetchRate != nil {
+			brokerFetchRate.Mark(1)
 		}
 	}()
 
@@ -1737,7 +1742,9 @@ func (b *Broker) sendAndReceiveSASLSCRAMv1(authSendReceiver func(authBytes []byt
 
 func (b *Broker) createSaslAuthenticateRequest(msg []byte) *SaslAuthenticateRequest {
 	authenticateRequest := SaslAuthenticateRequest{SaslAuthBytes: msg}
-	if b.conf.Version.IsAtLeast(V2_2_0_0) {
+	if b.conf.Version.IsAtLeast(V2_5_0_0) {
+		authenticateRequest.Version = 2
+	} else if b.conf.Version.IsAtLeast(V2_2_0_0) {
 		authenticateRequest.Version = 1
 	}
 

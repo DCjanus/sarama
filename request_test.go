@@ -335,18 +335,15 @@ func TestAllocateBodyProtocolVersions(t *testing.T) {
 		{
 			V2_4_0_0,
 			map[int16]int16{
-				// TODO: ProduceRequest v8 is not supported, but expected for KafkaVersion 2.4.0
-				// apiKeyProduce:                     8, // up from 7
-				apiKeyMetadata:           9, // up from 8
-				apiKeyLeaderAndIsr:       4, // up from 2
-				apiKeyStopReplica:        2, // up from 1
-				apiKeyUpdateMetadata:     6, // up from 5
-				apiKeyControlledShutdown: 3, // up from 2
-				// TODO: OffsetCommitRequest v8 is not supported, but expected for KafkaVersion 2.4.0
-				// apiKeyOffsetCommit:                8, // up from 7
-				apiKeyOffsetFetch: 6, // up from 5
-				// TODO: FindCoordinatorRequest v3 is not supported, but expected for KafkaVersion 2.4.0
-				// apiKeyFindCoordinator:             3, // up from 2
+				apiKeyProduce:                     8, // up from 7
+				apiKeyMetadata:                    9, // up from 8
+				apiKeyLeaderAndIsr:                4, // up from 2
+				apiKeyStopReplica:                 2, // up from 1
+				apiKeyUpdateMetadata:              6, // up from 5
+				apiKeyControlledShutdown:          3, // up from 2
+				apiKeyOffsetCommit:                8, // up from 7
+				apiKeyOffsetFetch:                 6, // up from 5
+				apiKeyFindCoordinator:             3, // up from 2
 				apiKeyJoinGroup:                   6, // up from 5
 				apiKeyHeartbeat:                   4, // up from 3
 				apiKeyLeaveGroup:                  4, // up from 2
@@ -363,6 +360,35 @@ func TestAllocateBodyProtocolVersions(t *testing.T) {
 				apiKeyAlterPartitionReassignments: 0, // new in 2.4
 				apiKeyListPartitionReassignments:  0, // new in 2.4
 				apiKeyOffsetDelete:                0, // new in 2.4
+			},
+		},
+		{
+			V2_5_0_0,
+			map[int16]int16{
+				apiKeyOffsetFetch:      7, // up from 6
+				apiKeyJoinGroup:        7, // up from 6
+				apiKeyInitProducerId:   3, // up from 2
+				apiKeyDescribeAcls:     2, // up from 1
+				apiKeyCreateAcls:       2, // up from 1
+				apiKeyDeleteAcls:       2, // up from 1
+				apiKeySASLAuth:         2, // up from 1
+				apiKeyCreatePartitions: 2, // up from 1
+				// TODO: SyncGroupRequest v5 is not supported, but expected for KafkaVersion 2.5.0
+				// apiKeySyncGroup:               5, // up from 4
+				// TODO: TxnOffsetCommitRequest v3 is not supported, but expected for KafkaVersion 2.5.0
+				// apiKeyTxnOffsetCommit:         3, // up from 2
+			},
+		},
+		{
+			V3_1_0_0,
+			map[int16]int16{
+				apiKeyJoinGroup: 8, // up from 7
+			},
+		},
+		{
+			V3_2_0_0,
+			map[int16]int16{
+				apiKeyLeaveGroup: 5, // up from 4
 			},
 		},
 		{
@@ -514,6 +540,7 @@ func testRequestDecode(t *testing.T, name string, rb protocolBody, packet []byte
 }
 
 func testResponse(t *testing.T, name string, res protocolBody, expected []byte) {
+	t.Helper()
 	encoded, err := encode(res, nil)
 	if err != nil {
 		t.Error(err)
