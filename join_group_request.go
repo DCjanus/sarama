@@ -158,10 +158,13 @@ func (r *JoinGroupRequest) decode(pd packetDecoder, version int16) (err error) {
 	if err != nil {
 		return err
 	}
+	if n < 0 {
+		return errInvalidArrayLength
+	}
 
 	if n > 0 {
 		r.GroupProtocols = make(map[string][]byte)
-		for i := 0; i < n; i++ {
+		for range n {
 			protocol := &GroupProtocol{}
 			if err := protocol.decode(pd); err != nil {
 				return err
@@ -211,7 +214,7 @@ func (r *JoinGroupRequest) isFlexibleVersion(version int16) bool {
 func (r *JoinGroupRequest) requiredVersion() KafkaVersion {
 	switch r.Version {
 	case 8:
-		return V3_1_0_0
+		return V3_2_0_0
 	case 7:
 		return V2_5_0_0
 	case 6:

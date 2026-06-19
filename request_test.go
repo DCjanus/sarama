@@ -71,7 +71,7 @@ var names = map[int16]string{
 	54:                                 "EndQuorumEpochRequest",
 	55:                                 "DescribeQuorumRequest",
 	56:                                 "AlterPartitionRequest",
-	57:                                 "UpdateFeaturesRequest",
+	apiKeyUpdateFeatures:               "UpdateFeaturesRequest",
 	58:                                 "EnvelopeRequest",
 	59:                                 "FetchSnapshotRequest",
 	apiKeyDescribeCluster:              "DescribeClusterRequest",
@@ -85,102 +85,12 @@ var names = map[int16]string{
 	68:                                 "ConsumerGroupHeartbeatRequest",
 }
 
-// allocateResponseBody is a test-only clone of allocateBody. There's no
-// central registry of types, so we can't do this using reflection for Response
-// types and assuming that the struct is identically named, just with Response
-// instead of Request.
-func allocateResponseBody(req protocolBody) protocolBody {
-	key := req.key()
-	version := req.version()
-	switch key {
-	case apiKeyProduce:
-		return &ProduceResponse{Version: version}
-	case apiKeyFetch:
-		return &FetchResponse{Version: version}
-	case apiKeyListOffsets:
-		return &OffsetResponse{Version: version}
-	case apiKeyMetadata:
-		return &MetadataResponse{Version: version}
-	case apiKeyOffsetCommit:
-		return &OffsetCommitResponse{Version: version}
-	case apiKeyOffsetFetch:
-		return &OffsetFetchResponse{Version: version}
-	case apiKeyFindCoordinator:
-		return &FindCoordinatorResponse{Version: version}
-	case apiKeyJoinGroup:
-		return &JoinGroupResponse{Version: version}
-	case apiKeyHeartbeat:
-		return &HeartbeatResponse{Version: version}
-	case apiKeyLeaveGroup:
-		return &LeaveGroupResponse{Version: version}
-	case apiKeySyncGroup:
-		return &SyncGroupResponse{Version: version}
-	case apiKeyDescribeGroups:
-		return &DescribeGroupsResponse{Version: version}
-	case apiKeyListGroups:
-		return &ListGroupsResponse{Version: version}
-	case apiKeySaslHandshake:
-		return &SaslHandshakeResponse{Version: version}
-	case apiKeyApiVersions:
-		return &ApiVersionsResponse{Version: version}
-	case apiKeyCreateTopics:
-		return &CreateTopicsResponse{Version: version}
-	case apiKeyDeleteTopics:
-		return &DeleteTopicsResponse{Version: version}
-	case apiKeyDeleteRecords:
-		return &DeleteRecordsResponse{Version: version}
-	case apiKeyInitProducerId:
-		return &InitProducerIDResponse{Version: version}
-	case apiKeyAddPartitionsToTxn:
-		return &AddPartitionsToTxnResponse{Version: version}
-	case apiKeyAddOffsetsToTxn:
-		return &AddOffsetsToTxnResponse{Version: version}
-	case apiKeyEndTxn:
-		return &EndTxnResponse{Version: version}
-	case apiKeyTxnOffsetCommit:
-		return &TxnOffsetCommitResponse{Version: version}
-	case apiKeyDescribeAcls:
-		return &DescribeAclsResponse{Version: version}
-	case apiKeyCreateAcls:
-		return &CreateAclsResponse{Version: version}
-	case apiKeyDeleteAcls:
-		return &DeleteAclsResponse{Version: version}
-	case apiKeyDescribeConfigs:
-		return &DescribeConfigsResponse{Version: version}
-	case apiKeyAlterConfigs:
-		return &AlterConfigsResponse{Version: version}
-	case apiKeyDescribeLogDirs:
-		return &DescribeLogDirsResponse{Version: version}
-	case apiKeySASLAuth:
-		return &SaslAuthenticateResponse{Version: version}
-	case apiKeyCreatePartitions:
-		return &CreatePartitionsResponse{Version: version}
-	case apiKeyDeleteGroups:
-		return &DeleteGroupsResponse{Version: version}
-	case apiKeyElectLeaders:
-		return &ElectLeadersResponse{Version: version}
-	case apiKeyIncrementalAlterConfigs:
-		return &IncrementalAlterConfigsResponse{Version: version}
-	case apiKeyAlterPartitionReassignments:
-		return &AlterPartitionReassignmentsResponse{Version: version}
-	case apiKeyListPartitionReassignments:
-		return &ListPartitionReassignmentsResponse{Version: version}
-	case apiKeyOffsetDelete:
-		return &DeleteOffsetsResponse{Version: version}
-	case apiKeyDescribeClientQuotas:
-		return &DescribeClientQuotasResponse{Version: version}
-	case apiKeyAlterClientQuotas:
-		return &AlterClientQuotasResponse{Version: version}
-	case apiKeyDescribeUserScramCredentials:
-		return &DescribeUserScramCredentialsResponse{Version: version}
-	case apiKeyAlterUserScramCredentials:
-		return &AlterUserScramCredentialsResponse{Version: version}
-	case apiKeyDescribeCluster:
-		return &DescribeClusterResponse{Version: version}
-	}
-	return nil
-}
-
+// TestAllocateBodyProtocolVersions tests two related version expectations:
+//  1. uncommented entries are protocol versions Sarama currently supports with
+//     parity to a given Kafka release version
+//  2. commented TODO entries are the max versions supported by the given Kafka
+//     release that Sarama still needs to implement for parity, this is for dev
+//     tracking.
 func TestAllocateBodyProtocolVersions(t *testing.T) {
 	type test struct {
 		version     KafkaVersion
@@ -301,9 +211,9 @@ func TestAllocateBodyProtocolVersions(t *testing.T) {
 				apiKeyMetadata:             7,  // up from 6
 				apiKeyOffsetCommit:         6,  // up from 4
 				apiKeyOffsetFetch:          5,  // up from 4
+				apiKeyDeleteTopics:         3,  // up from 2
 				apiKeyOffsetForLeaderEpoch: 2,  // up from 1
 				apiKeyTxnOffsetCommit:      2,  // up from 1
-				apiKeyDeleteTopics:         3,  // up from 2
 			},
 		},
 		{
@@ -373,60 +283,262 @@ func TestAllocateBodyProtocolVersions(t *testing.T) {
 				apiKeyDeleteAcls:       2, // up from 1
 				apiKeySASLAuth:         2, // up from 1
 				apiKeyCreatePartitions: 2, // up from 1
-				// TODO: SyncGroupRequest v5 is not supported, but expected for KafkaVersion 2.5.0
-				// apiKeySyncGroup:               5, // up from 4
-				// TODO: TxnOffsetCommitRequest v3 is not supported, but expected for KafkaVersion 2.5.0
-				// apiKeyTxnOffsetCommit:         3, // up from 2
+				apiKeySyncGroup:        5, // up from 4
+				apiKeyTxnOffsetCommit:  3, // up from 2
+			},
+		},
+		{
+			V2_6_0_0,
+			map[int16]int16{
+				apiKeyListGroups:           4, // up from 3
+				apiKeyDescribeLogDirs:      2, // up from 1
+				apiKeyDescribeClientQuotas: 0, // new in 2.6
+				apiKeyAlterClientQuotas:    0, // new in 2.6
+				apiKeyDeleteRecords:        2, // up from 1
+				apiKeyDescribeConfigs:      3, // up from 2
+			},
+		},
+		{
+			V2_7_0_0,
+			map[int16]int16{
+				apiKeyInitProducerId:               4,  // up from 3
+				apiKeyAddPartitionsToTxn:           2,  // up from 1
+				apiKeyAddOffsetsToTxn:              2,  // up from 1
+				apiKeyEndTxn:                       2,  // up from 1
+				apiKeyDescribeUserScramCredentials: 0,  // new in 2.7
+				apiKeyAlterUserScramCredentials:    0,  // new in 2.7
+				apiKeyFetch:                        12, // up from 11
+				apiKeyCreateTopics:                 6,  // up from 5
+				apiKeyDeleteTopics:                 5,  // up from 4
+				apiKeyCreatePartitions:             3,  // up from 2
+				apiKeyUpdateFeatures:               0,  // new in 2.7
+			},
+		},
+		{
+			V2_8_0_0,
+			map[int16]int16{
+				apiKeyMetadata:             11, // up from 9
+				apiKeyDescribeClientQuotas: 1,  // up from 0
+				apiKeyDescribeCluster:      0,  // new in 2.8
+				apiKeyDescribeConfigs:      4,  // up from 3
+				apiKeyAddPartitionsToTxn:   3,  // up from 2
+				apiKeyProduce:              9,  // up from 8
+				// TODO: ListOffsetsRequest v6 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyListOffsets:          6, // up from 5
+				// TODO: AddOffsetsToTxnRequest v3 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyAddOffsetsToTxn:      3, // up from 2
+				// TODO: EndTxnRequest v3 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyEndTxn:               3, // up from 2
+				// TODO: AlterConfigsRequest v2 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyAlterConfigs:         2, // up from 1
+				// TODO: AlterClientQuotasRequest v1 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyAlterClientQuotas:    1, // up from 0
+				// TODO: CreateTopicsRequest v7 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyCreateTopics:         7, // up from 6
+				// TODO: DeleteTopicsRequest v6 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyDeleteTopics:         6, // up from 5
+				// TODO: DescribeProducersRequest v0 is not supported, but expected for KafkaVersion 2.8.0
+				// apiKeyDescribeProducers /* (61) */: 0, // new in 2.8
+			},
+		},
+		{
+			V3_0_0_0,
+			map[int16]int16{
+				apiKeyOffsetFetch: 8, // up from 7
+				// TODO: ListOffsetsRequest v7 is not supported, but expected for KafkaVersion 3.0.0
+				// apiKeyListOffsets:     7, // up from 6
+				// TODO: FindCoordinatorRequest v4 is not supported, but expected for KafkaVersion 3.0.0
+				// apiKeyFindCoordinator: 4, // up from 3
 			},
 		},
 		{
 			V3_1_0_0,
 			map[int16]int16{
-				apiKeyJoinGroup: 8, // up from 7
+				// TODO: FetchRequest v13 is not supported, but expected for KafkaVersion 3.1.0
+				// apiKeyFetch:    13, // up from 12
+				// TODO: MetadataRequest v12 is not supported, but expected for KafkaVersion 3.1.0
+				// apiKeyMetadata: 12, // up from 11
 			},
 		},
 		{
 			V3_2_0_0,
 			map[int16]int16{
-				apiKeyLeaveGroup: 5, // up from 4
+				apiKeyJoinGroup:       8, // up from 7
+				apiKeyLeaveGroup:      5, // up from 4
+				apiKeyDescribeLogDirs: 3, // up from 2
+				// TODO: JoinGroupRequest v9 is not supported, but expected for KafkaVersion 3.2.0
+				// apiKeyJoinGroup:    9, // up from 7
+			},
+		},
+		{
+			V3_3_0_0,
+			map[int16]int16{
+				apiKeyDescribeLogDirs: 4, // up from 3
+				// TODO: DescribeAclsRequest v3 is not supported, but expected for KafkaVersion 3.3.0
+				// apiKeyDescribeAcls: 3, // up from 2
+				// TODO: CreateAclsRequest v3 is not supported, but expected for KafkaVersion 3.3.0
+				// apiKeyCreateAcls:   3, // up from 2
+				// TODO: DeleteAclsRequest v3 is not supported, but expected for KafkaVersion 3.3.0
+				// apiKeyDeleteAcls:   3, // up from 2
+				// TODO: UpdateFeaturesRequest v1 is not supported, but expected for KafkaVersion 3.3.0
+				// apiKeyUpdateFeatures /* (57) */: 1, // up from 0
+			},
+		},
+		{
+			V3_5_0_0,
+			map[int16]int16{
+				// TODO: FetchRequest v15 is not supported, but expected for KafkaVersion 3.5.0
+				// apiKeyFetch:              15, // up from 13
+				// TODO: ListOffsetsRequest v8 is not supported, but expected for KafkaVersion 3.5.0
+				// apiKeyListOffsets:        8,  // up from 7
+				// TODO: AddPartitionsToTxnRequest v4 is not supported, but expected for KafkaVersion 3.5.0
+				// apiKeyAddPartitionsToTxn: 4,  // up from 3
+				// TODO: ConsumerGroupHeartbeatRequest v0 is not supported, but expected for KafkaVersion 3.5.0
+				// apiKeyConsumerGroupHeartbeat /* (68) */: 0, // new in 3.5
+			},
+		},
+		{
+			V3_6_0_0,
+			map[int16]int16{
+				// TODO: OffsetCommitRequest v9 is not supported, but expected for KafkaVersion 3.6.0
+				// apiKeyOffsetCommit: 9, // up from 8
+			},
+		},
+		{
+			V3_7_0_0,
+			map[int16]int16{
+				apiKeyDescribeCluster: 1,  // up from 0
+				apiKeyProduce:         10, // up from 9
+				// TODO: FetchRequest v16 is not supported, but expected for KafkaVersion 3.7.0
+				// apiKeyFetch:           16, // up from 15
+				// TODO: OffsetFetchRequest v9 is not supported, but expected for KafkaVersion 3.7.0
+				// apiKeyOffsetFetch:     9,  // up from 8
+			},
+		},
+		{
+			V3_8_0_0,
+			map[int16]int16{
+				apiKeyListGroups: 5, // up from 4
+				// TODO: ProduceRequest v11 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyProduce:            11, // up from 10
+				// TODO: FindCoordinatorRequest v5 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyFindCoordinator:    5,  // up from 4
+				// TODO: InitProducerIdRequest v5 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyInitProducerId:     5,  // up from 4
+				// TODO: AddPartitionsToTxnRequest v5 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyAddPartitionsToTxn: 5,  // up from 4
+				// TODO: AddOffsetsToTxnRequest v4 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyAddOffsetsToTxn:    4,  // up from 3
+				// TODO: EndTxnRequest v4 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyEndTxn:             4,  // up from 3
+				// TODO: TxnOffsetCommitRequest v4 is not supported, but expected for KafkaVersion 3.8.0
+				// apiKeyTxnOffsetCommit:    4,  // up from 3
+			},
+		},
+		{
+			V3_9_0_0,
+			map[int16]int16{
+				// TODO: FetchRequest v17 is not supported, but expected for KafkaVersion 3.9.0
+				// apiKeyFetch:               17, // up from 16
+				// TODO: ListOffsetsRequest v9 is not supported, but expected for KafkaVersion 3.9.0
+				// apiKeyListOffsets:         9, // up from 8
+				// TODO: FindCoordinatorRequest v6 is not supported, but expected for KafkaVersion 3.9.0
+				// apiKeyFindCoordinator:     6,  // up from 5
+				apiKeyApiVersions: 4, // up from 3
+			},
+		},
+		{
+			V4_0_0_0,
+			map[int16]int16{
+				apiKeyDescribeCluster: 2, // up from 1
+				// TODO: ProduceRequest v12 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyProduce:             12, // up from 11
+				// TODO: ListOffsetsRequest v10 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyListOffsets:         10, // up from 9
+				// TODO: MetadataRequest v13 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyMetadata:            13, // up from 12
+				// TODO: DescribeGroupsRequest v6 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyDescribeGroups:      6,  // up from 5
+				// TODO: EndTxnRequest v5 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyEndTxn:              5,  // up from 4
+				// TODO: TxnOffsetCommitRequest v5 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyTxnOffsetCommit:     5,  // up from 4
+				// TODO: UpdateFeaturesRequest v2 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyUpdateFeatures /* (57) */: 2, // up from 1
+				// TODO: ConsumerGroupHeartbeatRequest v1 is not supported, but expected for KafkaVersion 4.0.0
+				// apiKeyConsumerGroupHeartbeat /* (68) */: 1, // up from 0
+			},
+		},
+		{
+			V4_1_0_0,
+			map[int16]int16{
+				// TODO: ProduceRequest v13 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyProduce:                     13, // up from 12
+				// TODO: FetchRequest v18 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyFetch:                       18, // up from 17
+				// TODO: OffsetCommitRequest v10 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyOffsetCommit:                10, // up from 9
+				// TODO: OffsetFetchRequest v10 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyOffsetFetch:                 10, // up from 9
+				// TODO: InitProducerIdRequest v6 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyInitProducerId:              6, // up from 5
+				// TODO: AlterPartitionReassignmentsRequest v1 is not supported, but expected for KafkaVersion 4.1.0
+				// apiKeyAlterPartitionReassignments: 1, // up from 0
+			},
+		},
+		{
+			V4_2_0_0,
+			map[int16]int16{
+				// TODO: ListOffsetsRequest v11 is not supported, but expected for KafkaVersion 4.2.0
+				// apiKeyListOffsets: 11, // up from 10
 			},
 		},
 		{
 			saramaMaxVersions, // placeholder version for current maximums implemented by Sarama
 			map[int16]int16{
-				apiKeyProduce:            maxVersion(&ProduceRequest{}),
-				apiKeyFetch:              maxVersion(&FetchRequest{}),
-				apiKeyListOffsets:        maxVersion(&OffsetRequest{}),
-				apiKeyMetadata:           maxVersion(&MetadataRequest{}),
-				apiKeyOffsetCommit:       maxVersion(&OffsetCommitRequest{}),
-				apiKeyOffsetFetch:        maxVersion(&OffsetFetchRequest{}),
-				apiKeyFindCoordinator:    maxVersion(&FindCoordinatorRequest{}),
-				apiKeyJoinGroup:          maxVersion(&JoinGroupRequest{}),
-				apiKeyHeartbeat:          maxVersion(&HeartbeatRequest{}),
-				apiKeyLeaveGroup:         maxVersion(&LeaveGroupRequest{}),
-				apiKeySyncGroup:          maxVersion(&SyncGroupRequest{}),
-				apiKeyDescribeGroups:     maxVersion(&DescribeGroupsRequest{}),
-				apiKeyListGroups:         maxVersion(&ListGroupsRequest{}),
-				apiKeySaslHandshake:      maxVersion(&SaslHandshakeRequest{}),
-				apiKeyApiVersions:        maxVersion(&ApiVersionsRequest{}),
-				apiKeyCreateTopics:       maxVersion(&CreateTopicsRequest{}),
-				apiKeyDeleteTopics:       maxVersion(&DeleteTopicsRequest{}),
-				apiKeyDeleteRecords:      maxVersion(&DeleteRecordsRequest{}),
-				apiKeyInitProducerId:     maxVersion(&InitProducerIDRequest{}),
-				apiKeyAddPartitionsToTxn: maxVersion(&AddPartitionsToTxnRequest{}),
-				apiKeyAddOffsetsToTxn:    maxVersion(&AddOffsetsToTxnRequest{}),
-				apiKeyEndTxn:             maxVersion(&EndTxnRequest{}),
-				apiKeyTxnOffsetCommit:    maxVersion(&TxnOffsetCommitRequest{}),
-				apiKeyDescribeAcls:       maxVersion(&DescribeAclsRequest{}),
-				apiKeyCreateAcls:         maxVersion(&CreateAclsRequest{}),
-				apiKeyDeleteAcls:         maxVersion(&DeleteAclsRequest{}),
-				apiKeyDescribeConfigs:    maxVersion(&DescribeConfigsRequest{}),
-				apiKeyAlterConfigs:       maxVersion(&AlterConfigsRequest{}),
-				apiKeyDescribeLogDirs:    maxVersion(&DescribeLogDirsRequest{}),
-				apiKeySASLAuth:           maxVersion(&SaslAuthenticateRequest{}),
-				apiKeyCreatePartitions:   maxVersion(&CreatePartitionsRequest{}),
-				apiKeyDeleteGroups:       maxVersion(&DeleteGroupsRequest{}),
-				apiKeyElectLeaders:       maxVersion(&ElectLeadersRequest{}),
+				apiKeyProduce:                      maxVersion(&ProduceRequest{}),
+				apiKeyFetch:                        maxVersion(&FetchRequest{}),
+				apiKeyListOffsets:                  maxVersion(&OffsetRequest{}),
+				apiKeyMetadata:                     maxVersion(&MetadataRequest{}),
+				apiKeyOffsetCommit:                 maxVersion(&OffsetCommitRequest{}),
+				apiKeyOffsetFetch:                  maxVersion(&OffsetFetchRequest{}),
+				apiKeyFindCoordinator:              maxVersion(&FindCoordinatorRequest{}),
+				apiKeyJoinGroup:                    maxVersion(&JoinGroupRequest{}),
+				apiKeyHeartbeat:                    maxVersion(&HeartbeatRequest{}),
+				apiKeyLeaveGroup:                   maxVersion(&LeaveGroupRequest{}),
+				apiKeySyncGroup:                    maxVersion(&SyncGroupRequest{}),
+				apiKeyDescribeGroups:               maxVersion(&DescribeGroupsRequest{}),
+				apiKeyListGroups:                   maxVersion(&ListGroupsRequest{}),
+				apiKeySaslHandshake:                maxVersion(&SaslHandshakeRequest{}),
+				apiKeyApiVersions:                  maxVersion(&ApiVersionsRequest{}),
+				apiKeyCreateTopics:                 maxVersion(&CreateTopicsRequest{}),
+				apiKeyDeleteTopics:                 maxVersion(&DeleteTopicsRequest{}),
+				apiKeyDeleteRecords:                maxVersion(&DeleteRecordsRequest{}),
+				apiKeyInitProducerId:               maxVersion(&InitProducerIDRequest{}),
+				apiKeyAddPartitionsToTxn:           maxVersion(&AddPartitionsToTxnRequest{}),
+				apiKeyAddOffsetsToTxn:              maxVersion(&AddOffsetsToTxnRequest{}),
+				apiKeyEndTxn:                       maxVersion(&EndTxnRequest{}),
+				apiKeyTxnOffsetCommit:              maxVersion(&TxnOffsetCommitRequest{}),
+				apiKeyDescribeAcls:                 maxVersion(&DescribeAclsRequest{}),
+				apiKeyCreateAcls:                   maxVersion(&CreateAclsRequest{}),
+				apiKeyDeleteAcls:                   maxVersion(&DeleteAclsRequest{}),
+				apiKeyDescribeConfigs:              maxVersion(&DescribeConfigsRequest{}),
+				apiKeyAlterConfigs:                 maxVersion(&AlterConfigsRequest{}),
+				apiKeyDescribeLogDirs:              maxVersion(&DescribeLogDirsRequest{}),
+				apiKeySASLAuth:                     maxVersion(&SaslAuthenticateRequest{}),
+				apiKeyCreatePartitions:             maxVersion(&CreatePartitionsRequest{}),
+				apiKeyDeleteGroups:                 maxVersion(&DeleteGroupsRequest{}),
+				apiKeyElectLeaders:                 maxVersion(&ElectLeadersRequest{}),
+				apiKeyIncrementalAlterConfigs:      maxVersion(&IncrementalAlterConfigsRequest{}),
+				apiKeyAlterPartitionReassignments:  maxVersion(&AlterPartitionReassignmentsRequest{}),
+				apiKeyListPartitionReassignments:   maxVersion(&ListPartitionReassignmentsRequest{}),
+				apiKeyOffsetDelete:                 maxVersion(&DeleteOffsetsRequest{}),
+				apiKeyDescribeClientQuotas:         maxVersion(&DescribeClientQuotasRequest{}),
+				apiKeyAlterClientQuotas:            maxVersion(&AlterClientQuotasRequest{}),
+				apiKeyDescribeUserScramCredentials: maxVersion(&DescribeUserScramCredentialsRequest{}),
+				apiKeyAlterUserScramCredentials:    maxVersion(&AlterUserScramCredentialsRequest{}),
+				apiKeyUpdateFeatures:               maxVersion(&UpdateFeaturesRequest{}),
+				apiKeyDescribeCluster:              maxVersion(&DescribeClusterRequest{}),
 			},
 		},
 	}
@@ -439,7 +551,7 @@ func TestAllocateBodyProtocolVersions(t *testing.T) {
 					t.Skipf("apikey %d is not implemented", key)
 				}
 				t.Logf("Testing %s V%d", reflect.TypeOf(req), version)
-				resp := allocateResponseBody(req)
+				resp := allocateResponseBody(req.key(), req.version())
 				assert.NotNil(t, resp, "%s has no matching response type in allocateResponseBody", reflect.TypeOf(req))
 				assert.Equal(t, req.isValidVersion(), resp.isValidVersion(), "%s isValidVersion should match %s", reflect.TypeOf(req), reflect.TypeOf(resp))
 				assert.Equal(t, req.requiredVersion(), resp.requiredVersion(), "%s requiredVersion should match %s", reflect.TypeOf(req), reflect.TypeOf(resp))

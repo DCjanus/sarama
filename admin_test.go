@@ -4,6 +4,7 @@ package sarama
 
 import (
 	"errors"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -894,6 +895,8 @@ func TestClusterAdminDescribeConfig(t *testing.T) {
 		{V1_1_0_0, 1, true},
 		{V1_1_1_0, 1, true},
 		{V2_0_0_0, 2, true},
+		{V2_6_0_0, 3, true},
+		{V2_8_0_0, 4, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.saramaVersion.String(), func(t *testing.T) {
@@ -940,6 +943,50 @@ func TestClusterAdminDescribeConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClusterAdminDescribeConfigs(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(seedBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
+		"DescribeConfigsRequest": NewMockDescribeConfigsResponse(t),
+	})
+
+	config := NewTestConfig()
+	config.Version = V2_8_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	require.NoError(t, err)
+	defer func() { _ = admin.Close() }()
+
+	resources := []*ConfigResource{
+		{Name: "r1", Type: TopicResource, ConfigNames: []string{"my_topic"}},
+		{Name: "r2", Type: TopicResource, ConfigNames: []string{"my_topic"}},
+	}
+
+	results, err := admin.DescribeConfigs(resources, DescribeConfigsOptions{
+		IncludeSynonyms:      true,
+		IncludeDocumentation: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	assert.Equal(t, "r1", results[0].Name)
+	assert.Equal(t, "r2", results[1].Name)
+	for _, result := range results {
+		assert.Equal(t, ErrNoError, result.ErrorCode)
+		assert.NotEmpty(t, result.Configs)
+	}
+
+	history := seedBroker.History()
+	describeReq, ok := history[len(history)-1].Request.(*DescribeConfigsRequest)
+	require.True(t, ok, "failed to find DescribeConfigsRequest in mockBroker history")
+	assert.Equal(t, int16(4), describeReq.Version)
+	assert.True(t, describeReq.IncludeSynonyms)
+	assert.True(t, describeReq.IncludeDocumentation)
+	assert.Len(t, describeReq.Resources, 2)
 }
 
 func TestClusterAdminDescribeConfigWithErrorCode(t *testing.T) {
@@ -1355,130 +1402,243 @@ func TestClusterAdminCreateAclErrorHandling(t *testing.T) {
 }
 
 func TestClusterAdminCreateAcls(t *testing.T) {
-	seedBroker := NewMockBroker(t, 1)
-	defer seedBroker.Close()
+	resource := Resource{ResourceType: AclResourceTopic, ResourceName: "my_topic"}
+	acl := Acl{Host: "localhost", Operation: AclOperationAlter, PermissionType: AclPermissionAny}
+	createOK := func(req *request) encoderWithHeader { return NewMockCreateAclsResponse(t).For(req.body) }
+	notController := func(req *request) encoderWithHeader {
+		r := req.body.(*CreateAclsRequest)
+		rsp := &CreateAclsResponse{Version: r.version()}
+		for range r.AclCreations {
+			rsp.AclCreationResponses = append(rsp.AclCreationResponses, &AclCreationResponse{Err: ErrNotController})
+		}
+		return rsp
+	}
 
-	seedBroker.SetHandlerByMap(map[string]MockResponse{
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetController(seedBroker.BrokerID()).
-			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
-		"CreateAclsRequest": NewMockCreateAclsResponse(t),
+	t.Run("creates acls", func(t *testing.T) {
+		admin := singleBrokerAdmin(t, V1_0_0_0, map[string]requestHandlerFunc{
+			"CreateAclsRequest": createOK,
+		})
+
+		rACLs := []*ResourceAcls{
+			{
+				Resource: resource,
+				Acls:     []*Acl{&acl},
+			},
+			{
+				Resource: Resource{ResourceType: AclResourceTopic, ResourceName: "your_topic"},
+				Acls:     []*Acl{&acl},
+			},
+		}
+
+		err := admin.CreateACLs(rACLs)
+		require.NoError(t, err)
+	})
+
+	t.Run("retries on stale controller", func(t *testing.T) {
+		admin, retriedOnNewController := staleControllerAdmin(t, V1_0_0_0, "CreateAclsRequest", notController, createOK)
+
+		err := admin.CreateACL(resource, acl)
+		require.NoError(t, err)
+		assert.True(t, retriedOnNewController(), "expected broker 2 to receive the retried request")
+	})
+
+	t.Run("returns error when retries exhausted", func(t *testing.T) {
+		admin, retriedOnNewController := staleControllerAdmin(t, V1_0_0_0, "CreateAclsRequest", notController, notController)
+
+		err := admin.CreateACL(resource, acl)
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrNotController)
+		assert.True(t, retriedOnNewController(), "expected broker 2 to receive the retried request")
+	})
+}
+
+// singleBrokerAdmin wires a single mock broker that names itself controller,
+// installs the given per-request handlers, and returns a ready admin client.
+func singleBrokerAdmin(t *testing.T, version KafkaVersion, handlers map[string]requestHandlerFunc) ClusterAdmin {
+	b := NewMockBroker(t, 1)
+	t.Cleanup(func() { b.Close() })
+
+	hm := map[string]requestHandlerFunc{
+		"MetadataRequest": func(req *request) encoderWithHeader {
+			return NewMockMetadataResponse(t).
+				SetController(b.BrokerID()).
+				SetBroker(b.Addr(), b.BrokerID()).For(req.body)
+		},
+	}
+	maps.Copy(hm, handlers)
+	b.SetHandlerFuncByMap(hm)
+
+	config := NewTestConfig()
+	config.Version = version
+	admin, err := NewClusterAdmin([]string{b.Addr()}, config)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
+
+	return admin
+}
+
+// staleControllerAdmin wires two mock brokers into a controller-failover
+// scenario and returns a ready admin client. Broker 1 answers reqType with
+// errResp and flips fresh metadata to name broker 2 as controller, modeling a
+// stale cached controller; broker 2 answers with okResp. retriedOnNewController
+// reports whether broker 2 received the request.
+func staleControllerAdmin(t *testing.T, version KafkaVersion, reqType string, errResp, okResp requestHandlerFunc) (admin ClusterAdmin, retriedOnNewController func() bool) {
+	b1 := NewMockBroker(t, 1)
+	b2 := NewMockBroker(t, 2)
+	t.Cleanup(func() { b1.Close(); b2.Close() })
+
+	var controllerID atomic.Int32
+	controllerID.Store(b1.BrokerID())
+	meta := func(req *request) encoderWithHeader {
+		return NewMockMetadataResponse(t).SetController(controllerID.Load()).
+			SetBroker(b1.Addr(), b1.BrokerID()).
+			SetBroker(b2.Addr(), b2.BrokerID()).For(req.body)
+	}
+
+	var newControllerReceivedRequest atomic.Bool
+	b1.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": meta,
+		reqType: func(req *request) encoderWithHeader {
+			controllerID.Store(b2.BrokerID()) // flip so the post-error refresh elects broker 2
+			return errResp(req)
+		},
+	})
+	b2.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+		"MetadataRequest": meta,
+		reqType: func(req *request) encoderWithHeader {
+			newControllerReceivedRequest.Store(true)
+			return okResp(req)
+		},
 	})
 
 	config := NewTestConfig()
-	config.Version = V1_0_0_0
-	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	config.Version = version
+	config.Admin.Retry.Backoff = time.Millisecond
+	admin, err := NewClusterAdmin([]string{b1.Addr()}, config)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = admin.Close() })
 
-	rACLs := []*ResourceAcls{
-		{
-			Resource: Resource{ResourceType: AclResourceTopic, ResourceName: "my_topic"},
-			Acls: []*Acl{
-				{Host: "localhost", Operation: AclOperationAlter, PermissionType: AclPermissionAny},
-			},
-		},
-		{
-			Resource: Resource{ResourceType: AclResourceTopic, ResourceName: "your_topic"},
-			Acls: []*Acl{
-				{Host: "localhost", Operation: AclOperationAlter, PermissionType: AclPermissionAny},
-			},
-		},
-	}
-
-	err = admin.CreateACLs(rACLs)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = admin.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	return admin, newControllerReceivedRequest.Load
 }
 
 func TestClusterAdminListAcls(t *testing.T) {
-	seedBroker := NewMockBroker(t, 1)
-	defer seedBroker.Close()
+	resourceName := "my_topic"
+	filter := AclFilter{ResourceType: AclResourceTopic, Operation: AclOperationRead, ResourceName: &resourceName}
+	listOK := func(req *request) encoderWithHeader { return NewMockListAclsResponse(t).For(req.body) }
+	notController := func(req *request) encoderWithHeader {
+		return &DescribeAclsResponse{Version: req.body.version(), Err: ErrNotController}
+	}
 
-	seedBroker.SetHandlerByMap(map[string]MockResponse{
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetController(seedBroker.BrokerID()).
-			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
-		"DescribeAclsRequest": NewMockListAclsResponse(t),
-		"CreateAclsRequest":   NewMockCreateAclsResponse(t),
+	t.Run("lists acls", func(t *testing.T) {
+		admin := singleBrokerAdmin(t, V1_0_0_0, map[string]requestHandlerFunc{
+			"DescribeAclsRequest": listOK,
+			"CreateAclsRequest":   func(req *request) encoderWithHeader { return NewMockCreateAclsResponse(t).For(req.body) },
+		})
+
+		err := admin.CreateACL(
+			Resource{ResourceType: AclResourceTopic, ResourceName: "my_topic"},
+			Acl{Host: "localhost", Operation: AclOperationAlter, PermissionType: AclPermissionAny},
+		)
+		require.NoError(t, err)
+
+		acls, err := admin.ListAcls(filter)
+		require.NoError(t, err)
+		assert.NotEmpty(t, acls)
 	})
 
-	config := NewTestConfig()
-	config.Version = V1_0_0_0
-	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("retries on stale controller", func(t *testing.T) {
+		admin, retriedOnNewController := staleControllerAdmin(t, V1_0_0_0, "DescribeAclsRequest", notController, listOK)
 
-	r := Resource{ResourceType: AclResourceTopic, ResourceName: "my_topic"}
-	a := Acl{Host: "localhost", Operation: AclOperationAlter, PermissionType: AclPermissionAny}
+		acls, err := admin.ListAcls(filter)
+		require.NoError(t, err)
+		assert.NotEmpty(t, acls)
+		assert.True(t, retriedOnNewController(), "expected broker 2 to receive the retried request")
+	})
 
-	err = admin.CreateACL(r, a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resourceName := "my_topic"
-	filter := AclFilter{
-		ResourceType: AclResourceTopic,
-		Operation:    AclOperationRead,
-		ResourceName: &resourceName,
-	}
+	t.Run("returns error when retries exhausted", func(t *testing.T) {
+		admin, _ := staleControllerAdmin(t, V1_0_0_0, "DescribeAclsRequest", notController, notController)
 
-	rAcls, err := admin.ListAcls(filter)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rAcls) == 0 {
-		t.Fatal("no acls present")
-	}
-
-	err = admin.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+		_, err := admin.ListAcls(filter)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrNotController)
+	})
 }
 
 func TestClusterAdminDeleteAcl(t *testing.T) {
-	seedBroker := NewMockBroker(t, 1)
-	defer seedBroker.Close()
+	resourceName := "my_topic"
+	filter := AclFilter{ResourceType: AclResourceTopic, Operation: AclOperationAlter, ResourceName: &resourceName}
+	deleteOK := func(req *request) encoderWithHeader { return NewMockDeleteAclsResponse(t).For(req.body) }
+	notController := func(req *request) encoderWithHeader {
+		return &DeleteAclsResponse{
+			Version:         req.body.version(),
+			FilterResponses: []*FilterResponse{{Err: ErrNotController}},
+		}
+	}
 
-	seedBroker.SetHandlerByMap(map[string]MockResponse{
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetController(seedBroker.BrokerID()).
-			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
-		"DeleteAclsRequest": NewMockDeleteAclsResponse(t),
+	t.Run("deletes acls", func(t *testing.T) {
+		admin := singleBrokerAdmin(t, V1_0_0_0, map[string]requestHandlerFunc{
+			"DeleteAclsRequest": deleteOK,
+		})
+
+		_, err := admin.DeleteACL(filter, false)
+		require.NoError(t, err)
 	})
 
-	config := NewTestConfig()
-	config.Version = V1_0_0_0
-	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
+	t.Run("retries on stale controller", func(t *testing.T) {
+		admin, retriedOnNewController := staleControllerAdmin(t, V1_0_0_0, "DeleteAclsRequest", notController, deleteOK)
+
+		_, err := admin.DeleteACL(filter, false)
+		require.NoError(t, err)
+		assert.True(t, retriedOnNewController(), "expected broker 2 to receive the retried request")
+	})
+
+	t.Run("returns error when retries exhausted", func(t *testing.T) {
+		admin, _ := staleControllerAdmin(t, V1_0_0_0, "DeleteAclsRequest", notController, notController)
+
+		_, err := admin.DeleteACL(filter, false)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrNotController)
+	})
+}
+
+func TestClusterAdminDescribeUserScramCredentials(t *testing.T) {
+	users := []string{"my_user"}
+	describeOK := func(req *request) encoderWithHeader {
+		return &DescribeUserScramCredentialsResponse{
+			Version: req.body.version(),
+			Results: []*DescribeUserScramCredentialsResult{{User: "my_user"}},
+		}
+	}
+	notController := func(req *request) encoderWithHeader {
+		return &DescribeUserScramCredentialsResponse{Version: req.body.version(), ErrorCode: ErrNotController}
 	}
 
-	resourceName := "my_topic"
-	filter := AclFilter{
-		ResourceType: AclResourceTopic,
-		Operation:    AclOperationAlter,
-		ResourceName: &resourceName,
-	}
+	t.Run("describes credentials", func(t *testing.T) {
+		admin := singleBrokerAdmin(t, V2_7_0_0, map[string]requestHandlerFunc{
+			"DescribeUserScramCredentialsRequest": describeOK,
+		})
 
-	_, err = admin.DeleteACL(filter, false)
-	if err != nil {
-		t.Fatal(err)
-	}
+		results, err := admin.DescribeUserScramCredentials(users)
+		require.NoError(t, err)
+		assert.NotEmpty(t, results)
+	})
 
-	err = admin.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("retries on stale controller", func(t *testing.T) {
+		admin, retriedOnNewController := staleControllerAdmin(t, V2_7_0_0, "DescribeUserScramCredentialsRequest", notController, describeOK)
+
+		results, err := admin.DescribeUserScramCredentials(users)
+		require.NoError(t, err)
+		assert.NotEmpty(t, results)
+		assert.True(t, retriedOnNewController(), "expected broker 2 to receive the retried request")
+	})
+
+	t.Run("returns error when retries exhausted", func(t *testing.T) {
+		admin, _ := staleControllerAdmin(t, V2_7_0_0, "DescribeUserScramCredentialsRequest", notController, notController)
+
+		_, err := admin.DescribeUserScramCredentials(users)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrNotController)
+	})
 }
 
 func TestElectLeaders(t *testing.T) {
@@ -1749,50 +1909,220 @@ func TestListConsumerGroupsMultiBroker(t *testing.T) {
 }
 
 func TestListConsumerGroupOffsets(t *testing.T) {
-	seedBroker := NewMockBroker(t, 1)
-	defer seedBroker.Close()
+	const (
+		group          = "my-group"
+		topic          = "my-topic"
+		partition      = int32(0)
+		expectedOffset = int64(0)
+	)
 
-	group := "my-group"
-	topic := "my-topic"
-	partition := int32(0)
-	expectedOffset := int64(0)
+	fetch := func(t *testing.T, version KafkaVersion) *OffsetFetchResponse {
+		t.Helper()
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetFetchRequest": NewMockOffsetFetchResponse(t).
+				SetOffset(group, topic, partition, expectedOffset, "", ErrNoError).
+				SetError(ErrNoError),
+			"MetadataRequest":        mockMetadataFor(t, broker),
+			"FindCoordinatorRequest": mockGroupCoordinators(t, broker, group),
+		})
+		response, err := newTestAdminAt(t, version, broker).
+			ListConsumerGroupOffsets(group, map[string][]int32{topic: {0}})
+		require.NoError(t, err)
+		return response
+	}
 
-	seedBroker.SetHandlerByMap(map[string]MockResponse{
-		"OffsetFetchRequest": NewMockOffsetFetchResponse(t).SetOffset(group, "my-topic", partition, expectedOffset, "", ErrNoError).SetError(ErrNoError),
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetController(seedBroker.BrokerID()).
-			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
-		"FindCoordinatorRequest": NewMockFindCoordinatorResponse(t).SetCoordinator(CoordinatorGroup, group, seedBroker),
+	t.Run("returns legacy blocks for older versions", func(t *testing.T) {
+		response := fetch(t, V1_0_0_0)
+		block := response.GetBlock(topic, partition)
+		require.NotNil(t, block)
+		assert.Equal(t, expectedOffset, block.Offset)
+		assert.Equal(t, expectedOffset, response.Blocks[topic][partition].Offset)
 	})
 
-	config := NewTestConfig()
-	config.Version = V1_0_0_0
-
-	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	response, err := admin.ListConsumerGroupOffsets(group, map[string][]int32{
-		topic: {0},
+	t.Run("mirrors v8 group response into legacy blocks", func(t *testing.T) {
+		response := fetch(t, V3_0_0_0)
+		block := response.GetBlock(topic, partition)
+		require.NotNil(t, block)
+		require.Contains(t, response.Blocks, topic)
+		assert.Equal(t, expectedOffset, response.Blocks[topic][partition].Offset)
+		assert.Equal(t, ErrNoError, response.Err)
 	})
-	if err != nil {
-		t.Fatalf("ListConsumerGroupOffsets failed with error %v", err)
+}
+
+func TestListConsumerGroupOffsetsBatch(t *testing.T) {
+	const (
+		topic           = "my-topic"
+		groupA          = "group-a"
+		groupB          = "group-b"
+		expectedOffsetA = int64(7)
+		expectedOffsetB = int64(13)
+	)
+	bothGroups := map[string]map[string][]int32{
+		groupA: {topic: {0}},
+		groupB: {topic: {0}},
 	}
 
-	block := response.GetBlock(topic, partition)
-	if block == nil {
-		t.Fatalf("Expected block for topic %v and partition %v to exist, but it doesn't", topic, partition)
+	// setup wires a single mock broker as the coordinator for every named group
+	// and serves the given OffsetFetchRequest handler. Returns a v3.0 admin.
+	setup := func(t *testing.T, offsetFetch MockResponse, groups ...string) ClusterAdmin {
+		t.Helper()
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"OffsetFetchRequest":     offsetFetch,
+			"MetadataRequest":        mockMetadataFor(t, broker),
+			"FindCoordinatorRequest": mockGroupCoordinators(t, broker, groups...),
+		})
+		return newTestAdminAt(t, V3_0_0_0, broker)
 	}
 
-	if block.Offset != expectedOffset {
-		t.Fatalf("Expected offset %v, got %v", expectedOffset, block.Offset)
+	// groupBlock builds a v8 response group entry with a single block.
+	groupBlock := func(group string, offset int64) OffsetFetchResponseGroup {
+		return OffsetFetchResponseGroup{
+			GroupId: group,
+			Blocks:  map[string]map[int32]*OffsetFetchResponseBlock{topic: {0: {Offset: offset}}},
+		}
 	}
 
-	err = admin.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("fetches offsets for multiple groups", func(t *testing.T) {
+		admin := setup(t, NewMockOffsetFetchResponse(t).
+			SetOffset(groupA, topic, 0, expectedOffsetA, "", ErrNoError).
+			SetOffset(groupB, topic, 0, expectedOffsetB, "", ErrNoError).
+			SetError(ErrNoError), groupA, groupB)
+
+		result, err := admin.ListConsumerGroupOffsetsBatch(bothGroups)
+		require.NoError(t, err)
+		assertGroupOffset(t, result, groupA, topic, 0, expectedOffsetA)
+		assertGroupOffset(t, result, groupB, topic, 0, expectedOffsetB)
+	})
+
+	t.Run("nil partitions fetches all topics for the group", func(t *testing.T) {
+		const otherTopic = "other-topic"
+		admin := setup(t, NewMockOffsetFetchResponse(t).
+			SetOffset(groupA, topic, 0, expectedOffsetA, "", ErrNoError).
+			SetOffset(groupA, otherTopic, 0, expectedOffsetB, "", ErrNoError).
+			SetError(ErrNoError), groupA)
+
+		result, err := admin.ListConsumerGroupOffsetsBatch(map[string]map[string][]int32{groupA: nil})
+		require.NoError(t, err)
+		assertGroupOffset(t, result, groupA, topic, 0, expectedOffsetA)
+		assertGroupOffset(t, result, groupA, otherTopic, 0, expectedOffsetB)
+	})
+
+	t.Run("rejects broker downgrade below v8", func(t *testing.T) {
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"ApiVersionsRequest": NewMockApiVersionsResponse(t).SetApiKeys([]ApiVersionsResponseKey{
+				{ApiKey: apiKeyOffsetFetch, MinVersion: 0, MaxVersion: 7},
+			}),
+			"MetadataRequest":        mockMetadataFor(t, broker),
+			"FindCoordinatorRequest": mockGroupCoordinators(t, broker, groupA, groupB),
+		})
+		config := NewTestConfig()
+		config.ApiVersionsRequest = true
+		config.Version = V3_0_0_0
+		admin, err := NewClusterAdmin([]string{broker.Addr()}, config)
+		require.NoError(t, err)
+		t.Cleanup(func() { admin.Close() })
+
+		_, err = admin.ListConsumerGroupOffsetsBatch(bothGroups)
+		require.ErrorIs(t, err, ErrUnsupportedVersion)
+	})
+
+	t.Run("limits broker's advertised max to client's supported max", func(t *testing.T) {
+		// Kafka 4.x brokers advertise OffsetFetch versions above the highest the
+		// client knows how to encode. The client must limit to its own max.
+		// 9999 keeps this test honest as we add more protocol versions later.
+		broker := newMockBroker(t, 1)
+		broker.SetHandlerByMap(map[string]MockResponse{
+			"ApiVersionsRequest": NewMockApiVersionsResponse(t).SetApiKeys([]ApiVersionsResponseKey{
+				{ApiKey: apiKeyOffsetFetch, MinVersion: 0, MaxVersion: 9999},
+			}),
+			"MetadataRequest":        mockMetadataFor(t, broker),
+			"FindCoordinatorRequest": mockGroupCoordinators(t, broker, groupA, groupB),
+			"OffsetFetchRequest": NewMockOffsetFetchResponse(t).
+				SetOffset(groupA, topic, 0, expectedOffsetA, "", ErrNoError).
+				SetOffset(groupB, topic, 0, expectedOffsetB, "", ErrNoError).
+				SetError(ErrNoError),
+		})
+		config := NewTestConfig()
+		config.ApiVersionsRequest = true
+		config.Version = V3_0_0_0
+		admin, err := NewClusterAdmin([]string{broker.Addr()}, config)
+		require.NoError(t, err)
+		t.Cleanup(func() { admin.Close() })
+
+		result, err := admin.ListConsumerGroupOffsetsBatch(bothGroups)
+		require.NoError(t, err)
+		assertGroupOffset(t, result, groupA, topic, 0, expectedOffsetA)
+		assertGroupOffset(t, result, groupB, topic, 0, expectedOffsetB)
+	})
+
+	t.Run("retries on retriable per-group error", func(t *testing.T) {
+		first := &OffsetFetchResponse{Version: 8, Groups: []OffsetFetchResponseGroup{
+			{GroupId: groupA, Err: ErrNotCoordinatorForConsumer},
+			groupBlock(groupB, expectedOffsetB),
+		}}
+		second := &OffsetFetchResponse{Version: 8, Groups: []OffsetFetchResponseGroup{
+			groupBlock(groupA, expectedOffsetA),
+			groupBlock(groupB, expectedOffsetB),
+		}}
+		admin := setup(t, NewMockSequence(first, second), groupA, groupB)
+
+		result, err := admin.ListConsumerGroupOffsetsBatch(bothGroups)
+		require.NoError(t, err)
+		assertGroupOffset(t, result, groupA, topic, 0, expectedOffsetA)
+		assertGroupOffset(t, result, groupB, topic, 0, expectedOffsetB)
+	})
+
+	t.Run("returns non-retriable per-group error without retry", func(t *testing.T) {
+		resp := &OffsetFetchResponse{Version: 8, Groups: []OffsetFetchResponseGroup{
+			{GroupId: groupA, Err: ErrGroupAuthorizationFailed},
+			groupBlock(groupB, expectedOffsetB),
+		}}
+		admin := setup(t, NewMockWrapper(resp), groupA, groupB)
+
+		result, err := admin.ListConsumerGroupOffsetsBatch(bothGroups)
+		require.NoError(t, err)
+		require.Contains(t, result, groupA)
+		assert.Equal(t, ErrGroupAuthorizationFailed, result[groupA].Err)
+		assertGroupOffset(t, result, groupB, topic, 0, expectedOffsetB)
+	})
+
+	t.Run("splits groups across coordinators", func(t *testing.T) {
+		seed := newMockBroker(t, 1)
+		coordA := newMockBroker(t, 2)
+		coordB := newMockBroker(t, 3)
+		metadata := mockMetadataFor(t, seed, coordA, coordB)
+		findCoord := NewMockFindCoordinatorResponse(t).
+			SetCoordinator(CoordinatorGroup, groupA, coordA).
+			SetCoordinator(CoordinatorGroup, groupB, coordB)
+		seed.SetHandlerByMap(map[string]MockResponse{
+			"MetadataRequest":        metadata,
+			"FindCoordinatorRequest": findCoord,
+		})
+		for _, c := range []struct {
+			broker *MockBroker
+			group  string
+			offset int64
+		}{
+			{coordA, groupA, expectedOffsetA},
+			{coordB, groupB, expectedOffsetB},
+		} {
+			c.broker.SetHandlerByMap(map[string]MockResponse{
+				"MetadataRequest":        metadata,
+				"FindCoordinatorRequest": findCoord,
+				"OffsetFetchRequest": NewMockOffsetFetchResponse(t).
+					SetOffset(c.group, topic, 0, c.offset, "", ErrNoError).
+					SetError(ErrNoError),
+			})
+		}
+
+		result, err := newTestAdminAt(t, V3_0_0_0, seed).ListConsumerGroupOffsetsBatch(bothGroups)
+		require.NoError(t, err)
+		assertGroupOffset(t, result, groupA, topic, 0, expectedOffsetA)
+		assertGroupOffset(t, result, groupB, topic, 0, expectedOffsetB)
+	})
 }
 
 // newMockBroker spins up a MockBroker with auto-cleanup.
@@ -1807,13 +2137,39 @@ func newMockBroker(t *testing.T, id int32) *MockBroker {
 // retry backoff disabled and auto-cleanup.
 func newTestAdmin(t *testing.T, seed *MockBroker) ClusterAdmin {
 	t.Helper()
+	return newTestAdminAt(t, V2_1_0_0, seed)
+}
+
+// newTestAdminAt is like newTestAdmin but with a caller-chosen KafkaVersion.
+func newTestAdminAt(t *testing.T, version KafkaVersion, seed *MockBroker) ClusterAdmin {
+	t.Helper()
 	config := NewTestConfig()
-	config.Version = V2_1_0_0
+	config.Version = version
 	config.Admin.Retry.Backoff = 0
 	admin, err := NewClusterAdmin([]string{seed.Addr()}, config)
 	require.NoError(t, err)
 	t.Cleanup(func() { admin.Close() })
 	return admin
+}
+
+// mockGroupCoordinators builds a FindCoordinator handler placing every named
+// group on coordinator.
+func mockGroupCoordinators(t *testing.T, coordinator *MockBroker, groups ...string) *MockFindCoordinatorResponse {
+	t.Helper()
+	r := NewMockFindCoordinatorResponse(t)
+	for _, g := range groups {
+		r.SetCoordinator(CoordinatorGroup, g, coordinator)
+	}
+	return r
+}
+
+// assertGroupOffset asserts result has groupID with the expected offset at topic/partition.
+func assertGroupOffset(t *testing.T, result map[string]*OffsetFetchResponseGroup, groupID, topic string, partition int32, expected int64) {
+	t.Helper()
+	require.Contains(t, result, groupID)
+	block := result[groupID].GetBlock(topic, partition)
+	require.NotNil(t, block)
+	assert.Equal(t, expected, block.Offset)
 }
 
 // mockMetadataFor builds a MockMetadataResponse with controller and brokers
@@ -2290,5 +2646,33 @@ func Test_retryOnError(t *testing.T) {
 		if time.Since(startTime) >= 4*testBackoffTime {
 			t.Errorf("attempt+sleep+retry+sleep+retry+sleep+retry should take less than 4 * backoff time")
 		}
+	})
+}
+
+func TestClusterAdminUpdateFeatures(t *testing.T) {
+	seedBroker := NewMockBroker(t, 1)
+	defer seedBroker.Close()
+
+	seedBroker.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetController(seedBroker.BrokerID()).
+			SetBroker(seedBroker.Addr(), seedBroker.BrokerID()),
+		"UpdateFeaturesRequest": NewMockUpdateFeaturesResponse(t),
+	})
+
+	config := NewTestConfig()
+	config.Version = V2_7_0_0
+	admin, err := NewClusterAdmin([]string{seedBroker.Addr()}, config)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, admin.Close())
+	}()
+
+	t.Run("returns per-feature results", func(t *testing.T) {
+		results, err := admin.UpdateFeatures([]FeatureUpdate{
+			{Feature: "metadata.version", MaxVersionLevel: 2},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []UpdatableFeatureResult{{Feature: "metadata.version"}}, results)
 	})
 }

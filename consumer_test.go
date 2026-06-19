@@ -40,7 +40,7 @@ func TestConsumerOffsetManual(t *testing.T) {
 	// skipped because parseRecords(): offset < child.offset
 	mockFetchResponse.SetMessage("my_topic", 0, manualOffset-1, testMsg)
 
-	for i := int64(0); i < 10; i++ {
+	for i := range int64(10) {
 		mockFetchResponse.SetMessage("my_topic", 0, i+manualOffset, testMsg)
 	}
 
@@ -71,7 +71,7 @@ func TestConsumerOffsetManual(t *testing.T) {
 	if hwmo := consumer.HighWaterMarkOffset(); hwmo != offsetNewest {
 		t.Errorf("Expected high water mark offset %d, found %d", offsetNewest, hwmo)
 	}
-	for i := int64(0); i < 10; i++ {
+	for i := range int64(10) {
 		select {
 		case message := <-consumer.Messages():
 			assertMessageOffset(t, message, i+manualOffset)
@@ -103,7 +103,7 @@ func TestConsumerMessageWithKey(t *testing.T) {
 	// skipped because parseRecords(): offset < child.offset
 	mockFetchResponse.SetMessageWithKey("my_topic", 0, manualOffset-1, testKey, testMsg)
 
-	for i := int64(0); i < 10; i++ {
+	for i := range int64(10) {
 		mockFetchResponse.SetMessageWithKey("my_topic", 0, i+manualOffset, testKey, testMsg)
 	}
 
@@ -134,7 +134,7 @@ func TestConsumerMessageWithKey(t *testing.T) {
 	if hwmo := consumer.HighWaterMarkOffset(); hwmo != offsetNewest {
 		t.Errorf("Expected high water mark offset %d, found %d", offsetNewest, hwmo)
 	}
-	for i := int64(0); i < 10; i++ {
+	for i := range int64(10) {
 		select {
 		case message := <-consumer.Messages():
 			assertMessageOffset(t, message, i+manualOffset)
@@ -1010,7 +1010,7 @@ func newReadReplicaTest(t *testing.T, testConfig readReplicaTestConfig) (Partiti
 		SetOffset("my_topic", 0, OffsetOldest, 0)
 
 	toSequence := func(fetches []readReplicaFetch) MockResponse {
-		responses := make([]interface{}, len(fetches))
+		responses := make([]any, len(fetches))
 		for i, fetch := range fetches {
 			responses[i] = fetch
 		}
@@ -1272,7 +1272,7 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 		}
 	}
 
-	for i := int32(0); i < 2; i++ {
+	for i := range int32(2) {
 		consumer, err := master.ConsumePartition("my_topic", i, 0)
 		if err != nil {
 			t.Fatal(err)
@@ -1293,14 +1293,14 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 	  * my_topic/1 -> leader1 will serve 0 messages`)
 
 	mockFetchResponse := NewMockFetchResponse(t, 1)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		mockFetchResponse.SetMessage("my_topic", 0, int64(i), testMsg)
 	}
 	leader0.SetHandlerByMap(map[string]MockResponse{
 		"FetchRequest": mockFetchResponse,
 	})
 
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		checkMessage(0, i)
 	}
 
@@ -1339,7 +1339,7 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 	for i := 4; i < 7; i++ {
 		mockFetchResponse2.SetMessage("my_topic", 0, int64(i), testMsg)
 	}
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		mockFetchResponse2.SetMessage("my_topic", 1, int64(i), testMsg)
 	}
 	leader1.SetHandlerByMap(map[string]MockResponse{
@@ -1347,7 +1347,7 @@ func TestConsumerRebalancingMultiplePartitions(t *testing.T) {
 		"MetadataRequest": metadataResponse,
 	})
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		checkMessage(1, i)
 	}
 	for i := 4; i < 7; i++ {
@@ -1490,7 +1490,7 @@ func TestConsumerBounceWithReferenceOpen(t *testing.T) {
 		SetOffset("my_topic", 1, OffsetNewest, 2100)
 
 	mockFetchResponse := NewMockFetchResponse(t, 1)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		mockFetchResponse.SetMessage("my_topic", 0, int64(1000+i), testMsg)
 		mockFetchResponse.SetMessage("my_topic", 1, int64(2000+i), testMsg)
 	}
@@ -1735,7 +1735,7 @@ func TestPartitionConsumerDispatcherOrphanedClose(t *testing.T) {
 			children:        make(map[string]map[int32]*partitionConsumer),
 			brokerConsumers: make(map[*Broker]*brokerConsumer),
 		}
-		bc := &brokerConsumer{consumer: c, input: make(chan *brokerSubscription), refs: 1}
+		bc := &brokerConsumer{consumer: c, input: make(chan *brokerSubscription), refs: 1, stop: make(chan none)}
 		child := &partitionConsumer{
 			consumer:       c,
 			conf:           config,
@@ -1850,7 +1850,7 @@ func TestPartitionConsumerComputeBackoff(t *testing.T) {
 			seen = append(seen, retries)
 			return 0
 		}
-		for i := 0; i < 3; i++ {
+		for range 3 {
 			child.computeBackoff()
 		}
 		require.Equal(t, []int{1, 2, 3}, seen)
@@ -2212,7 +2212,7 @@ func testConsumerInterceptor(
 	broker0 := NewMockBroker(t, 0)
 
 	mockFetchResponse := NewMockFetchResponse(t, 1)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		mockFetchResponse.SetMessage("my_topic", 0, int64(i), testMsg)
 	}
 
@@ -2238,7 +2238,7 @@ func testConsumerInterceptor(
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		select {
 		case msg := <-consumer.Messages():
 			expectationFn(t, i, msg)
@@ -2320,6 +2320,55 @@ func TestConsumerError(t *testing.T) {
 	if !errors.Is(err, ErrOutOfBrokers) {
 		t.Error("unexpected errors.Is")
 	}
+}
+
+func TestConsumerQueueSubscriptionAfterUnref(t *testing.T) {
+	metrics.UseNilMetrics = true
+	defer func() { metrics.UseNilMetrics = false }()
+
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	config := NewTestConfig()
+
+	broker0 := NewMockBroker(t, 0)
+	defer broker0.Close()
+	broker0.SetHandlerByMap(map[string]MockResponse{
+		"MetadataRequest": NewMockMetadataResponse(t).
+			SetBroker(broker0.Addr(), broker0.BrokerID()),
+	})
+
+	client, err := NewClient([]string{broker0.Addr()}, config)
+	require.NoError(t, err)
+	defer client.Close()
+
+	c := &consumer{
+		client:          client,
+		conf:            config,
+		children:        make(map[string]map[int32]*partitionConsumer),
+		brokerConsumers: make(map[*Broker]*brokerConsumer),
+		metricRegistry:  newCleanupRegistry(config.MetricRegistry),
+	}
+
+	realBroker := client.Brokers()[0]
+
+	child := &partitionConsumer{
+		consumer:       c,
+		conf:           config,
+		topic:          "my_topic",
+		partition:      0,
+		trigger:        make(chan none, 1),
+		dying:          make(chan none),
+		dispatcherStop: make(chan none),
+	}
+
+	// a responseFeeder requeueing a timed-out subscription holds no ref on the
+	// brokerConsumer, so the requeue can arrive after the last unref
+	bc := c.refBrokerConsumer(realBroker)
+	c.unrefBrokerConsumer(bc)
+
+	require.NotPanics(t, func() {
+		require.False(t, bc.queueSubscription(newBrokerSubscription(child)))
+	})
 }
 
 // TestConsumerAbortNoGoroutineLeak verifies that brokerConsumer.abort() does

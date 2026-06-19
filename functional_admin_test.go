@@ -49,6 +49,19 @@ func topicWithEvenLeaders(t *testing.T, adminClient ClusterAdmin, client Client,
 	if err != nil {
 		return "", err
 	}
+
+	// topic creation is asynchronous; wait for every partition to have an
+	// elected leader before returning (producing too early fails with
+	// ErrNotLeaderForPartition or ErrUnknownTopicOrPartition)
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		require.NoError(t, client.RefreshMetadata(topic))
+		for partition := int32(0); partition < numPartitions; partition++ {
+			leader, err := client.Leader(topic, partition)
+			require.NoError(t, err, "no leader for %s/%d", topic, partition)
+			require.NotNil(t, leader)
+		}
+	}, 30*time.Second, 250*time.Millisecond, "leaders were not elected for all partitions of %s", topic)
+
 	return topic, nil
 }
 
@@ -425,6 +438,59 @@ func TestFuncAdminListConsumerGroupOffsets(t *testing.T) {
 	t.Logf("coordinator broker %d", coordinator.id)
 }
 
+func TestFuncAdminListConsumerGroupOffsetsBatch(t *testing.T) {
+	checkKafkaVersion(t, "3.0.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	config := NewFunctionalTestConfig()
+	config.ClientID = t.Name()
+	client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	require.NoError(t, err)
+	defer safeClose(t, client)
+
+	groupA := testFuncConsumerGroupID(t)
+	groupB := testFuncConsumerGroupID(t)
+	const (
+		topic      = "test.4"
+		partition  = int32(0)
+		offsetGrpA = int64(2)
+		offsetGrpB = int64(3)
+	)
+
+	for _, c := range []struct {
+		group  string
+		offset int64
+	}{{groupA, offsetGrpA}, {groupB, offsetGrpB}} {
+		offsetMgr, err := NewOffsetManagerFromClient(c.group, client)
+		require.NoError(t, err)
+		markOffset(t, offsetMgr, topic, partition, c.offset)
+		offsetMgr.Commit()
+		safeClose(t, offsetMgr)
+	}
+
+	adminClient, err := NewClusterAdminFromClient(client)
+	require.NoError(t, err)
+
+	result, err := adminClient.ListConsumerGroupOffsetsBatch(map[string]map[string][]int32{
+		groupA: {topic: {partition}},
+		groupB: {topic: {partition}},
+	})
+	require.NoError(t, err)
+
+	for _, c := range []struct {
+		group  string
+		offset int64
+	}{{groupA, offsetGrpA}, {groupB, offsetGrpB}} {
+		require.Contains(t, result, c.group)
+		require.Equal(t, ErrNoError, result[c.group].Err)
+		block := result[c.group].GetBlock(topic, partition)
+		require.NotNil(t, block, "missing block for %s/%s/%d", c.group, topic, partition)
+		require.Equal(t, ErrNoError, block.Err)
+		require.Equal(t, c.offset, block.Offset)
+	}
+}
+
 func TestFuncAdminListOffsets(t *testing.T) {
 	t.Parallel()
 	checkKafkaVersion(t, "2.1.0.0")
@@ -495,6 +561,52 @@ func TestFuncAdminListOffsets(t *testing.T) {
 		midTimestamp,
 		midIndex,
 		"mid timestamp",
+	)
+}
+
+func TestFuncAdminDeleteRecords(t *testing.T) {
+	t.Parallel()
+	checkKafkaVersion(t, "0.11.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	const (
+		partitionsCount      = int32(1)
+		messagesPerPartition = 10
+		deleteBeforeOffset   = int64(5)
+	)
+
+	config := NewFunctionalTestConfig()
+	config.ClientID = t.Name()
+	config.Producer.Partitioner = NewManualPartitioner
+	config.Producer.Return.Successes = true
+
+	client, err := NewClient(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	require.NoError(t, err)
+	defer safeClose(t, client)
+
+	adminClient, err := NewClusterAdminFromClient(client)
+	require.NoError(t, err)
+
+	topic, err := topicWithEvenLeaders(t, adminClient, client, partitionsCount)
+	require.NoError(t, err)
+
+	produceMessagesForPartitions(t, client, topic, partitionsCount, messagesPerPartition, time.Now().UnixMilli())
+
+	require.NoError(t, client.RefreshMetadata(topic))
+
+	err = adminClient.DeleteRecords(topic, map[int32]int64{0: deleteBeforeOffset})
+	require.NoError(t, err)
+
+	// truncating records before deleteBeforeOffset moves the partition low water mark there
+	listOffsetsAndValidate(
+		t,
+		adminClient,
+		topic,
+		partitionsCount,
+		OffsetOldest,
+		deleteBeforeOffset,
+		"earliest after delete",
 	)
 }
 
@@ -589,6 +701,64 @@ func TestFuncAdminDescribeLogDirs(t *testing.T) {
 				assert.NotZero(t, logDir.UsableBytes)
 			}
 		}
+	}
+}
+
+func TestFuncAdminDescribeConfig(t *testing.T) {
+	t.Parallel()
+	checkKafkaVersion(t, "0.11.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	kafkaVersion, err := ParseKafkaVersion(FunctionalTestEnv.KafkaVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	config := NewFunctionalTestConfig()
+	adminClient, err := NewClusterAdmin(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer safeClose(t, adminClient)
+
+	// describe all broker configs (nil ConfigNames) to exercise the null
+	// compact-array path on the v4 flexible wire format
+	results, err := adminClient.DescribeConfigs(
+		[]*ConfigResource{{Type: BrokerResource, Name: "1"}},
+		DescribeConfigsOptions{},
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	require.Equal(t, ErrNoError, results[0].ErrorCode)
+	require.NotEmpty(t, results[0].Configs)
+
+	for _, entry := range results[0].Configs {
+		assert.NotEmpty(t, entry.Name)
+	}
+
+	// IncludeDocumentation, ConfigType and Documentation are available from v3
+	// (Kafka 2.6.0); request them via the DescribeConfigs options
+	if kafkaVersion.IsAtLeast(V2_6_0_0) {
+		documented, err := adminClient.DescribeConfigs(
+			[]*ConfigResource{{Type: BrokerResource, Name: "1"}},
+			DescribeConfigsOptions{IncludeSynonyms: true, IncludeDocumentation: true},
+		)
+		require.NoError(t, err)
+		require.Len(t, documented, 1)
+		require.NotEmpty(t, documented[0].Configs)
+
+		var typed, hasDoc bool
+		for _, entry := range documented[0].Configs {
+			if entry.Type != UnknownConfigType {
+				typed = true
+			}
+			if entry.Documentation != nil && *entry.Documentation != "" {
+				hasDoc = true
+			}
+		}
+		assert.True(t, typed, "expected at least one config with a known ConfigType")
+		assert.True(t, hasDoc, "expected at least one config with Documentation")
 	}
 }
 
@@ -843,4 +1013,88 @@ func TestFuncAdminIncrementalAlterConfigs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to alter config: %v", err)
 	}
+}
+
+func TestFuncAdminUpdateFeatures(t *testing.T) {
+	t.Parallel()
+	// feature updates need a KRaft cluster; ZooKeeper-mode brokers don't
+	// advertise any features
+	checkKafkaVersion(t, "4.0.0.0")
+	setupFunctionalTest(t)
+	defer teardownFunctionalTest(t)
+
+	kafkaVersion, err := ParseKafkaVersion(FunctionalTestEnv.KafkaVersion)
+	require.NoError(t, err)
+
+	config := NewFunctionalTestConfig()
+	config.Version = kafkaVersion
+	adminClient, err := NewClusterAdmin(FunctionalTestEnv.KafkaBrokerAddrs, config)
+	require.NoError(t, err)
+	defer safeClose(t, adminClient)
+
+	// an update for a made-up feature name should be rejected without
+	// touching cluster state; the controller fails the whole batch with
+	// INVALID_UPDATE_VERSION when every update in it failed
+	_, err = adminClient.UpdateFeatures([]FeatureUpdate{{
+		Feature:         "sarama.unsupported.feature",
+		MaxVersionLevel: 1,
+	}})
+	require.ErrorIs(t, err, ErrInvalidUpdateVersion)
+
+	controller, err := adminClient.Controller()
+	require.NoError(t, err)
+
+	describeFeatures := func(t require.TestingT) (supported map[string]int16, finalized map[string]int16) {
+		// v4 needed: v0-v3 responses omit supported features with min version 0
+		rsp, err := controller.ApiVersions(&ApiVersionsRequest{
+			Version:               4,
+			ClientSoftwareName:    defaultClientSoftwareName,
+			ClientSoftwareVersion: version(),
+		})
+		require.NoError(t, err)
+		supported = make(map[string]int16, len(rsp.SupportedFeatures))
+		for _, f := range rsp.SupportedFeatures {
+			supported[f.Name] = f.MaxVersion
+		}
+		finalized = make(map[string]int16, len(rsp.FinalizedFeatures))
+		for _, f := range rsp.FinalizedFeatures {
+			finalized[f.Name] = f.MaxVersionLevel
+		}
+		return supported, finalized
+	}
+
+	supported, finalized := describeFeatures(t)
+	require.NotEmpty(t, supported)
+
+	// upgrade every feature whose finalized level sits below the supported
+	// max, one batch each so a single rejection doesn't sink the rest
+	upgraded := make(map[string]int16)
+	for name, maxVersion := range supported {
+		// kraft.version upgrades are refused on a static-quorum cluster
+		if name == "kraft.version" || finalized[name] >= maxVersion {
+			continue
+		}
+		results, err := adminClient.UpdateFeatures([]FeatureUpdate{{
+			Feature:         name,
+			MaxVersionLevel: maxVersion,
+		}})
+		require.NoError(t, err, "upgrade %s to %d", name, maxVersion)
+		require.Len(t, results, 1)
+		assert.Equal(t, name, results[0].Feature)
+		assert.Equal(t, ErrNoError, results[0].ErrorCode)
+		upgraded[name] = maxVersion
+	}
+	if len(upgraded) == 0 {
+		t.Log("no features eligible for upgrade")
+		return
+	}
+	t.Logf("upgraded features: %v", upgraded)
+
+	// finalized levels propagate to brokers via the metadata log, so poll
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
+		_, finalized := describeFeatures(t)
+		for name, level := range upgraded {
+			assert.Equal(t, level, finalized[name], "feature %s", name)
+		}
+	}, 30*time.Second, 250*time.Millisecond, "finalized feature levels did not reach the requested levels")
 }

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func initOffsetManagerWithBackoffFunc(
@@ -185,20 +187,18 @@ func TestOffsetManagerCommitSequence(t *testing.T) {
 	const commitsPerPartition = 1000
 
 	var wg sync.WaitGroup
-	for p := 0; p < numPartitions; p++ {
+	for p := range numPartitions {
 		pom, err := om.ManagePartition("topic", int32(p))
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		wg.Add(1)
-		go func() {
-			for c := 0; c < commitsPerPartition; c++ {
+		wg.Go(func() {
+			for c := range commitsPerPartition {
 				pom.MarkOffset(int64(c+1), "")
 				om.Commit()
 			}
-			wg.Done()
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -311,7 +311,7 @@ func TestOffsetManagerCommitConcurrentDeadlock(t *testing.T) {
 	const numPartitions = 4
 	const commitsPerGoroutine = 200
 	poms := make([]PartitionOffsetManager, numPartitions)
-	for p := 0; p < numPartitions; p++ {
+	for p := range numPartitions {
 		pom, err := om.ManagePartition("topic", int32(p))
 		if err != nil {
 			t.Fatal(err)
@@ -322,16 +322,14 @@ func TestOffsetManagerCommitConcurrentDeadlock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		var wg sync.WaitGroup
-		for p := 0; p < numPartitions; p++ {
+		for p := range numPartitions {
 			pom := poms[p]
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for c := 0; c < commitsPerGoroutine; c++ {
+			wg.Go(func() {
+				for c := range commitsPerGoroutine {
 					pom.MarkOffset(int64(c+1), "")
 					om.Commit()
 				}
-			}()
+			})
 		}
 		wg.Wait()
 		close(done)
@@ -559,6 +557,63 @@ func TestOffsetManagerFetchInitialLoadInProgress(t *testing.T) {
 	if retryCount.Load() == 0 {
 		t.Fatal("Expected at least one retry")
 	}
+}
+
+// fetchInitialOffset must retry when OffsetFetchResponse v2+ surfaces a
+// retriable coordinator error at the top level with no per-partition blocks
+func TestOffsetManagerFetchInitialTopLevelErr(t *testing.T) {
+	config := NewTestConfig()
+	config.Metadata.Retry.Max = 1
+	config.Consumer.Offsets.AutoCommit.Interval = 1 * time.Millisecond
+	// V0_10_2_0 is the first version that negotiates OffsetFetch v2,
+	// which carries a top-level error code
+	config.Version = V0_10_2_0
+
+	broker := NewMockBroker(t, 1)
+	defer broker.Close()
+	coordinator := NewMockBroker(t, 2)
+	defer coordinator.Close()
+
+	seedMeta := new(MetadataResponse)
+	seedMeta.AddBroker(coordinator.Addr(), coordinator.BrokerID())
+	seedMeta.AddTopicPartition("my_topic", 0, 1, []int32{}, []int32{}, []int32{}, ErrNoError)
+	broker.Returns(seedMeta)
+
+	testClient, err := NewClient([]string{broker.Addr()}, config)
+	require.NoError(t, err)
+
+	coordinator.Returns(&ConsumerMetadataResponse{
+		CoordinatorID:   coordinator.BrokerID(),
+		CoordinatorHost: "127.0.0.1",
+		CoordinatorPort: coordinator.Port(),
+	})
+
+	om, err := NewOffsetManagerFromClient("group", testClient)
+	require.NoError(t, err)
+
+	// first OffsetFetch reports NOT_COORDINATOR at the top level with no blocks
+	coordinator.Returns(&OffsetFetchResponse{Version: 2, Err: ErrNotCoordinatorForConsumer})
+
+	newCoordinator := NewMockBroker(t, 3)
+	defer newCoordinator.Close()
+	coordinator.Returns(&ConsumerMetadataResponse{
+		CoordinatorID:   newCoordinator.BrokerID(),
+		CoordinatorHost: "127.0.0.1",
+		CoordinatorPort: newCoordinator.Port(),
+	})
+
+	okResp := &OffsetFetchResponse{Version: 2}
+	okResp.AddBlock("my_topic", 0, &OffsetFetchResponseBlock{
+		Err: ErrNoError, Offset: 5, Metadata: "test_meta",
+	})
+	newCoordinator.Returns(okResp)
+
+	pom, err := om.ManagePartition("my_topic", 0)
+	require.NoError(t, err)
+
+	safeClose(t, pom)
+	safeClose(t, om)
+	safeClose(t, testClient)
 }
 
 func TestPartitionOffsetManagerInitialOffset(t *testing.T) {
