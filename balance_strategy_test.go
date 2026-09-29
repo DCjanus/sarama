@@ -178,6 +178,14 @@ func TestBalanceStrategyRoundRobin(t *testing.T) {
 				"M3": map[string][]int32{"TT2": {0}},
 			},
 		},
+		{
+			members: map[string][]string{"M1": {"T1"}, "M2": {"T1"}},
+			topics:  map[string][]int32{"T1": {0, 1}, "T2": {0}},
+			expected: BalanceStrategyPlan{
+				"M1": map[string][]int32{"T1": {0}},
+				"M2": map[string][]int32{"T1": {1}},
+			},
+		},
 	}
 
 	strategy := NewBalanceStrategyRoundRobin()
@@ -1664,7 +1672,7 @@ func Test_stickyBalanceStrategy_Plan_SameSubscriptions(t *testing.T) {
 	topics := make(map[string][]int32, 15)
 	for i := range 15 {
 		partitions := make([]int32, i)
-		for j := 0; j < i; j++ {
+		for j := range i {
 			partitions[j] = int32(j)
 		}
 		topics[fmt.Sprintf("topic%d", i)] = partitions

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -476,7 +477,12 @@ func TestNewOffsetManagerOffsetsManualCommit(t *testing.T) {
 // Test recovery from ErrNotCoordinatorForConsumer
 // on first fetchInitialOffset call
 func TestOffsetManagerFetchInitialFail(t *testing.T) {
-	om, testClient, broker, coordinator := initOffsetManager(t, 0)
+	var retryCount atomic.Int32
+	backoff := func(retries, maxRetries int) time.Duration {
+		retryCount.Add(1)
+		return 0
+	}
+	om, testClient, broker, coordinator := initOffsetManagerWithBackoffFunc(t, 0, backoff, NewTestConfig())
 	defer broker.Close()
 	defer coordinator.Close()
 
@@ -508,13 +514,13 @@ func TestOffsetManagerFetchInitialFail(t *testing.T) {
 	newCoordinator.Returns(fetchResponse2)
 
 	pom, err := om.ManagePartition("my_topic", 0)
-	if err != nil {
-		t.Error(err)
-	}
+	require.NoError(t, err)
 
 	safeClose(t, pom)
 	safeClose(t, om)
 	safeClose(t, testClient)
+
+	require.NotZero(t, retryCount.Load(), "expected the retry to back off")
 }
 
 // Test fetchInitialOffset retry on ErrOffsetsLoadInProgress
@@ -558,6 +564,98 @@ func TestOffsetManagerFetchInitialLoadInProgress(t *testing.T) {
 	if retryCount.Load() == 0 {
 		t.Fatal("Expected at least one retry")
 	}
+}
+
+// A read_committed consumer must not start from a committed offset while a
+// transactional offset commit for the partition is still pending.
+func TestOffsetManagerFetchInitialStable(t *testing.T) {
+	newStableTest := func(t *testing.T, offsetFetch requestHandlerFunc, apiVersions []ApiVersionsResponseKey) PartitionOffsetManager {
+		t.Helper()
+		seedBroker := NewMockBroker(t, 1)
+		t.Cleanup(seedBroker.Close)
+		handlers := map[string]requestHandlerFunc{
+			"MetadataRequest": func(req *request) encoderWithHeader {
+				resp := &MetadataResponse{Version: req.body.version()}
+				resp.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
+				return resp
+			},
+			"FindCoordinatorRequest": func(req *request) encoderWithHeader {
+				resp := &FindCoordinatorResponse{Version: req.body.version()}
+				resp.Coordinator = &Broker{id: seedBroker.brokerID, addr: seedBroker.Addr()}
+				return resp
+			},
+			"OffsetFetchRequest": offsetFetch,
+		}
+		config := NewTestConfig()
+		if apiVersions != nil {
+			config.ApiVersionsRequest = true
+			handlers["ApiVersionsRequest"] = func(r *request) encoderWithHeader {
+				return &ApiVersionsResponse{Version: r.body.version(), ApiKeys: apiVersions}
+			}
+		}
+		seedBroker.SetHandlerFuncByMap(handlers)
+
+		config.Version = V2_5_0_0
+		config.Consumer.IsolationLevel = ReadCommitted
+		config.Metadata.Retry.Backoff = 0
+		testClient, err := NewClient([]string{seedBroker.Addr()}, config)
+		require.NoError(t, err)
+		t.Cleanup(func() { safeClose(t, testClient) })
+		om, err := NewOffsetManagerFromClient("group", testClient)
+		require.NoError(t, err)
+		t.Cleanup(func() { safeClose(t, om) })
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		t.Cleanup(func() { safeClose(t, pom) })
+		return pom
+	}
+
+	t.Run("waits for a pending transactional offset", func(t *testing.T) {
+		var unstable atomic.Int32
+		// offset 5 is committed and a transaction's offset 6 is pending; the
+		// commit marker lands after the first UNSTABLE_OFFSET_COMMIT
+		pom := newStableTest(t, func(r *request) encoderWithHeader {
+			req := r.body.(*OffsetFetchRequest)
+			resp := &OffsetFetchResponse{Version: req.Version}
+			block := &OffsetFetchResponseBlock{Offset: 5, LeaderEpoch: -1}
+			switch {
+			case req.RequireStable && unstable.Load() == 0:
+				unstable.Add(1)
+				block = &OffsetFetchResponseBlock{Offset: -1, LeaderEpoch: -1, Err: ErrUnstableOffsetCommit}
+			case unstable.Load() > 0:
+				block.Offset = 6
+			}
+			resp.AddBlock("my_topic", 0, block)
+			return resp
+		}, nil)
+
+		offset, _ := pom.NextOffset()
+		require.EqualValues(t, 6, offset, "started before the pending transactional offset was committed")
+	})
+
+	t.Run("fetches without RequireStable from a broker before 2.5", func(t *testing.T) {
+		var fetched atomic.Pointer[OffsetFetchRequest]
+		pom := newStableTest(t, func(r *request) encoderWithHeader {
+			req := r.body.(*OffsetFetchRequest)
+			fetched.Store(req)
+			resp := &OffsetFetchResponse{Version: req.Version}
+			resp.AddBlock("my_topic", 0, &OffsetFetchResponseBlock{Offset: 5, LeaderEpoch: -1})
+			return resp
+		}, []ApiVersionsResponseKey{
+			{ApiKey: apiKeyMetadata, MaxVersion: 9},
+			{ApiKey: apiKeyOffsetFetch, MaxVersion: 6},
+			{ApiKey: apiKeyFindCoordinator, MaxVersion: 3},
+			{ApiKey: apiKeyApiVersions, MaxVersion: 3},
+		})
+
+		offset, _ := pom.NextOffset()
+		require.EqualValues(t, 5, offset)
+		req := fetched.Load()
+		require.NotNil(t, req)
+		require.EqualValues(t, 6, req.Version)
+		require.False(t, req.RequireStable)
+	})
 }
 
 // fetchInitialOffset must retry when OffsetFetchResponse v2+ surfaces a
@@ -953,6 +1051,40 @@ func (c *offsetCommitCapture) requests() []*OffsetCommitRequest {
 	return slices.Clone(c.reqs)
 }
 
+func TestPartitionOffsetManagerClose(t *testing.T) {
+	t.Run("returns without auto-commit", func(t *testing.T) {
+		om, capture := newCapturingOffsetManager(t, false)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		pom.MarkOffset(100, "")
+
+		closed := make(chan error, 1)
+		go func() { closed <- pom.Close() }()
+		require.EventuallyWithT(t, func(c *assert.CollectT) {
+			assert.Len(c, closed, 1, "pom.Close did not return")
+		}, 2*time.Second, 10*time.Millisecond)
+		require.NoError(t, <-closed)
+		require.Nil(t, om.findPOM("my_topic", 0))
+		require.Empty(t, capture.requests())
+	})
+
+	t.Run("leaves the POM that replaced it managed", func(t *testing.T) {
+		om, _ := newCapturingOffsetManager(t, false)
+
+		old, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		old.AsyncClose()
+		om.Commit()
+
+		replacement, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+
+		require.NoError(t, old.Close())
+		require.Same(t, replacement, om.findPOM("my_topic", 0))
+	})
+}
+
 func initHandledOffsetManager(t *testing.T, config *Config, commit MockResponse) (*offsetManager, Client, *MockBroker) {
 	t.Helper()
 	config.Version = V2_0_0_0
@@ -960,7 +1092,7 @@ func initHandledOffsetManager(t *testing.T, config *Config, commit MockResponse)
 	broker := NewMockBroker(t, 1)
 	metadata := NewMockMetadataResponse(t).SetBroker(broker.Addr(), broker.BrokerID())
 	offsetFetch := NewMockOffsetFetchResponse(t).SetError(ErrNoError)
-	for p := int32(0); p < 4; p++ {
+	for p := range int32(4) {
 		metadata = metadata.SetLeader("my_topic", p, broker.BrokerID())
 		offsetFetch = offsetFetch.SetOffset("group", "my_topic", p, 5, "", ErrNoError)
 	}
@@ -1001,7 +1133,7 @@ func TestOffsetManagerRemovePartitions(t *testing.T) {
 		om, capture := newCapturingOffsetManager(t, true)
 
 		poms := map[int32]PartitionOffsetManager{}
-		for p := int32(0); p < 4; p++ {
+		for p := range int32(4) {
 			pom, err := om.ManagePartition("my_topic", p)
 			require.NoError(t, err)
 			pom.MarkOffset(int64(100+p), "")
@@ -1016,7 +1148,7 @@ func TestOffsetManagerRemovePartitions(t *testing.T) {
 				committed = append(committed, p)
 			}
 		}
-		require.ElementsMatch(t, []int32{2,3}, committed)
+		require.ElementsMatch(t, []int32{2, 3}, committed)
 
 		require.Nil(t, om.findPOM("my_topic", 2))
 		require.Nil(t, om.findPOM("my_topic", 3))
@@ -1031,7 +1163,7 @@ func TestOffsetManagerRemovePartitions(t *testing.T) {
 		om, capture := newCapturingOffsetManager(t, false)
 
 		poms := map[int32]PartitionOffsetManager{}
-		for p := int32(0); p < 2; p++ {
+		for p := range int32(2) {
 			pom, err := om.ManagePartition("my_topic", p)
 			require.NoError(t, err)
 			pom.MarkOffset(int64(100+p), "")
@@ -1065,21 +1197,19 @@ func TestOffsetManagerRemovePartitions(t *testing.T) {
 		config.Consumer.Return.Errors = true
 
 		commit := NewMockOffsetCommitResponse(t)
-		for p := int32(0); p < 4; p++ {
+		for p := range int32(4) {
 			commit = commit.SetError("group", "my_topic", p, ErrOffsetMetadataTooLarge)
 		}
 		om, _, _ := initHandledOffsetManager(t, config, commit)
 
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 300; i++ {
+		wg.Go(func() {
+			for range 300 {
 				om.Commit()
 			}
-		}()
+		})
 
-		for i := 0; i < 120; i++ {
+		for i := range 120 {
 			p := int32(i % 4)
 			pom, err := om.ManagePartition("my_topic", p)
 			require.NoError(t, err)
@@ -1094,8 +1224,8 @@ func TestOffsetManagerRemovePartitions(t *testing.T) {
 	})
 }
 
-func TestOffsetManagerSetGeneration(t *testing.T) {
-	t.Run("commits carry the generation most recently set", func(t *testing.T) {
+func TestOffsetManagerTransitionGeneration(t *testing.T) {
+	t.Run("commits carry the generation and member id most recently set", func(t *testing.T) {
 		om, capture := newCapturingOffsetManager(t, false)
 
 		pom, err := om.ManagePartition("my_topic", 0)
@@ -1103,7 +1233,9 @@ func TestOffsetManagerSetGeneration(t *testing.T) {
 
 		pom.MarkOffset(100, "")
 		om.Commit()
-		om.setGeneration(7)
+		require.NoError(t, om.transitionGeneration(func() (int32, string, error) {
+			return 7, "new-member", nil
+		}))
 		pom.MarkOffset(101, "")
 		om.Commit()
 
@@ -1111,6 +1243,8 @@ func TestOffsetManagerSetGeneration(t *testing.T) {
 		require.NotEmpty(t, reqs)
 		require.Equal(t, int32(1), reqs[0].ConsumerGroupGeneration)
 		require.Equal(t, int32(7), reqs[len(reqs)-1].ConsumerGroupGeneration)
+		require.Equal(t, "member", reqs[0].ConsumerID)
+		require.Equal(t, "new-member", reqs[len(reqs)-1].ConsumerID)
 	})
 
 	t.Run("waits for an in-flight commit to finish", func(t *testing.T) {
@@ -1131,10 +1265,11 @@ func TestOffsetManagerSetGeneration(t *testing.T) {
 		}()
 		<-gate.entered
 
-		genDone := make(chan none)
+		genDone := make(chan error, 1)
 		go func() {
-			om.setGeneration(7)
-			close(genDone)
+			genDone <- om.transitionGeneration(func() (int32, string, error) {
+				return 7, "member", nil
+			})
 		}()
 		require.Never(t, func() bool {
 			select {
@@ -1147,7 +1282,7 @@ func TestOffsetManagerSetGeneration(t *testing.T) {
 
 		close(gate.release)
 		<-commitDone
-		<-genDone
+		require.NoError(t, <-genDone)
 
 		pom.MarkOffset(101, "")
 		om.Commit()
@@ -1155,6 +1290,49 @@ func TestOffsetManagerSetGeneration(t *testing.T) {
 		reqs := capture.requests()
 		require.Equal(t, int32(1), reqs[0].ConsumerGroupGeneration)
 		require.Equal(t, int32(7), reqs[len(reqs)-1].ConsumerGroupGeneration)
+	})
+
+	t.Run("holds commits until the next generation is established", func(t *testing.T) {
+		om, capture := newCapturingOffsetManager(t, false)
+
+		pom, err := om.ManagePartition("my_topic", 0)
+		require.NoError(t, err)
+		pom.MarkOffset(100, "")
+
+		started := make(chan none)
+		release := make(chan none)
+		transitionDone := make(chan error, 1)
+		go func() {
+			transitionDone <- om.transitionGeneration(func() (int32, string, error) {
+				close(started)
+				<-release
+				return 7, "member", nil
+			})
+		}()
+		<-started
+
+		commitDone := make(chan none)
+		go func() {
+			om.Commit()
+			close(commitDone)
+		}()
+
+		require.Never(t, func() bool {
+			select {
+			case <-commitDone:
+				return true
+			default:
+				return false
+			}
+		}, 150*time.Millisecond, 20*time.Millisecond)
+
+		close(release)
+		require.NoError(t, <-transitionDone)
+		<-commitDone
+
+		reqs := capture.requests()
+		require.Len(t, reqs, 1)
+		require.Equal(t, int32(7), reqs[0].ConsumerGroupGeneration)
 	})
 }
 

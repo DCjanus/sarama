@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"runtime"
 	"sync"
@@ -1366,9 +1365,7 @@ func TestClientBackgroundMetadataUpdater(t *testing.T) {
 		defer seedBroker.Close()
 
 		w := &matchWriter{substr: []byte("no specific topics to update metadata")}
-		orig := Logger
-		Logger = log.New(w, "", 0)
-		t.Cleanup(func() { Logger = orig })
+		redirectLogger(t, w)
 
 		conf := NewTestConfig()
 		conf.Metadata.Full = false
@@ -1607,5 +1604,201 @@ func TestUpdateBroker(t *testing.T) {
 		assert.Equal(t, "127.0.0.1:19093", c.brokers[1].Addr())
 		assert.Equal(t, 2, int(c.brokers[2].ID()))
 		assert.Equal(t, "127.0.0.1:19094", c.brokers[2].Addr())
+	})
+}
+
+func TestDeregisterBroker(t *testing.T) {
+	seed := NewBroker("127.0.0.1:9092")
+	stale := &Broker{id: 1, addr: "127.0.0.1:9093"}
+	c := &client{
+		brokers:     map[int32]*Broker{1: stale},
+		seedBrokers: []*Broker{seed},
+	}
+
+	// broker 1 moves to a new address while a caller still holds the old one
+	c.updateBroker([]*Broker{{id: 1, addr: "127.0.0.1:19093"}})
+	current := c.brokers[1]
+	require.NotSame(t, stale, current)
+
+	c.deregisterBroker(stale)
+	assert.Same(t, current, c.brokers[1], "stale broker removed its replacement")
+	assert.Equal(t, []*Broker{seed}, c.seedBrokers)
+
+	c.deregisterBroker(current)
+	assert.NotContains(t, c.brokers, int32(1))
+}
+
+func TestClientCloseRaces(t *testing.T) {
+	t.Run("a refresh in flight during Close does not reopen a seed broker", func(t *testing.T) {
+		seed := NewMockBroker(t, 1)
+		defer seed.Close()
+		leader := NewMockBroker(t, 2)
+
+		metadata := new(MetadataResponse)
+		metadata.AddBroker(leader.Addr(), leader.BrokerID())
+		metadata.AddTopicPartition("my_topic", 0, leader.BrokerID(), nil, nil, nil, ErrNoError)
+		seed.SetHandlerByMap(map[string]MockResponse{
+			"MetadataRequest": NewMockWrapper(metadata),
+		})
+		received := make(chan none)
+		release := make(chan none)
+		leader.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+			"MetadataRequest": func(req *request) encoderWithHeader {
+				close(received)
+				<-release
+				return nil
+			},
+		})
+
+		conf := NewTestConfig()
+		conf.Metadata.Retry.Max = 0
+		c, err := NewClient([]string{seed.Addr()}, conf)
+		require.NoError(t, err)
+		seedBroker := c.(*client).seedBrokers[0]
+
+		refreshed := make(chan error, 1)
+		go func() { refreshed <- c.RefreshMetadata("my_topic") }()
+		<-received
+
+		require.NoError(t, c.Close())
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			connected, _ := seedBroker.Connected()
+			assert.False(ct, connected, "Close did not close the seed broker")
+		}, 5*time.Second, time.Millisecond)
+
+		// the leader drops the connection, so the refresh falls back to the seed
+		close(release)
+		leader.Close()
+		require.Error(t, assertDoneWithin(t, refreshed, 5*time.Second), "a refresh cut short by Close should fail")
+
+		connected, _ := seedBroker.Connected()
+		assert.False(t, connected, "seed broker reopened after Close")
+		_ = seedBroker.Close()
+	})
+}
+
+func TestClientLeaderEpoch(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		firstID, secondID Uuid
+		wantEpoch         int32
+	}{
+		{"keeps the newer epoch when a lagging broker reports an older one", Uuid{1}, Uuid{1}, 5},
+		{"accepts an older epoch once the topic is re-created", Uuid{1}, Uuid{2}, 3},
+		{"accepts an older epoch when the broker sends no topic id", Uuid{}, Uuid{}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := NewMockBroker(t, 1)
+			defer seed.Close()
+
+			var epoch atomic.Int32
+			var id atomic.Pointer[Uuid]
+			epoch.Store(5)
+			id.Store(&tc.firstID)
+			seed.SetHandlerFuncByMap(map[string]requestHandlerFunc{
+				"MetadataRequest": func(req *request) encoderWithHeader {
+					res := &MetadataResponse{Version: req.body.version()}
+					res.AddBroker(seed.Addr(), seed.BrokerID())
+					res.AddTopicPartition("my_topic", 0, seed.BrokerID(), nil, nil, nil, ErrNoError)
+					res.Topics[0].Uuid = *id.Load()
+					res.Topics[0].Partitions[0].LeaderEpoch = epoch.Load()
+					return res
+				},
+			})
+
+			conf := NewTestConfig()
+			conf.Version = V2_8_0_0 // metadata responses carry topic ids
+			conf.Metadata.Retry.Max = 0
+			c, err := NewClient([]string{seed.Addr()}, conf)
+			require.NoError(t, err)
+			defer safeClose(t, c)
+
+			_, e, err := c.LeaderAndEpoch("my_topic", 0)
+			require.NoError(t, err)
+			require.Equal(t, int32(5), e)
+
+			epoch.Store(3)
+			id.Store(&tc.secondID)
+			require.NoError(t, c.RefreshMetadata("my_topic"))
+
+			_, e, err = c.LeaderAndEpoch("my_topic", 0)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantEpoch, e)
+		})
+	}
+}
+
+func TestClientCoordinatorMoves(t *testing.T) {
+	t.Run("replaced coordinator brokers are closed", func(t *testing.T) {
+		seed := NewMockBroker(t, 1)
+		defer seed.Close()
+		b1 := NewMockBroker(t, 2)
+		defer b1.Close()
+		b2 := NewMockBroker(t, 3)
+		defer b2.Close()
+
+		metadata := new(MetadataResponse)
+		metadata.AddBroker(seed.Addr(), seed.BrokerID())
+		// every FindCoordinator moves coordinator id 9 to the other address,
+		// so each refresh replaces the coordinator's *Broker
+		var moves atomic.Int64
+		handlers := map[string]requestHandlerFunc{
+			"MetadataRequest": func(req *request) encoderWithHeader { return metadata },
+			"FindCoordinatorRequest": func(req *request) encoderWithHeader {
+				addr := b1.Addr()
+				if moves.Add(1)%2 == 0 {
+					addr = b2.Addr()
+				}
+				return &FindCoordinatorResponse{Version: req.body.version(), Coordinator: &Broker{id: 9, addr: addr}}
+			},
+		}
+		seed.SetHandlerFuncByMap(handlers)
+		b1.SetHandlerFuncByMap(handlers)
+		b2.SetHandlerFuncByMap(handlers)
+
+		conf := NewTestConfig()
+		conf.Metadata.Retry.Max = 0
+		c, err := NewClient([]string{seed.Addr()}, conf)
+		require.NoError(t, err)
+		require.NoError(t, c.RefreshCoordinator("g"))
+
+		// readers look the coordinator up while it keeps moving
+		var mu sync.Mutex
+		seen := map[*Broker]none{}
+		stop := make(chan none)
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if b, err := c.Coordinator("g"); err == nil {
+						mu.Lock()
+						seen[b] = none{}
+						mu.Unlock()
+					}
+				}
+			})
+		}
+		for range 500 {
+			_ = c.RefreshCoordinator("g")
+		}
+		close(stop)
+		wg.Wait()
+		require.NoError(t, c.Close())
+
+		// Close and the replacements close brokers asynchronously
+		require.EventuallyWithT(t, func(ct *assert.CollectT) {
+			leaked := 0
+			for b := range seen {
+				if connected, _ := b.Connected(); connected {
+					leaked++
+				}
+			}
+			assert.Zero(ct, leaked, "replaced coordinator brokers still connected after Close (of %d seen)", len(seen))
+		}, 5*time.Second, 10*time.Millisecond)
 	})
 }
