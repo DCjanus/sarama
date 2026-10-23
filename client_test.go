@@ -1405,10 +1405,7 @@ func TestClientAutorefreshShutdownRace(t *testing.T) {
 		SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
 		SetLeader("foo", 0, seedBroker.BrokerID())
 
-	refreshStarted := make(chan struct{})
-	releaseRefresh := make(chan struct{})
-	release := sync.OnceFunc(func() { close(releaseRefresh) })
-	t.Cleanup(release)
+	refreshClient := make(chan *client)
 	var refreshOnce sync.Once
 	initialRequest := true
 	seedBroker.setHandler(func(req *request) encoderWithHeader {
@@ -1417,8 +1414,11 @@ func TestClientAutorefreshShutdownRace(t *testing.T) {
 			metadataResponse.setVersion(req.body.version())
 			return metadataResponse
 		}
-		refreshOnce.Do(func() { close(refreshStarted) })
-		<-releaseRefresh
+		refreshOnce.Do(func() {
+			if c := <-refreshClient; c != nil {
+				<-c.closer
+			}
+		})
 		return refreshResponse.For(req.body)
 	})
 
@@ -1428,23 +1428,19 @@ func TestClientAutorefreshShutdownRace(t *testing.T) {
 	require.NoError(t, err)
 	closeClient := sync.OnceValue(c.Close)
 	t.Cleanup(func() {
-		release()
+		close(refreshClient)
 		assert.NoError(t, closeClient())
 	})
 	concreteClient := c.(*client)
 
-	// Hold an actual background metadata request in flight until Close starts.
+	// The send confirms a background request is in flight. Its handler waits
+	// for Close to request shutdown before replying.
 	select {
-	case <-refreshStarted:
+	case refreshClient <- concreteClient:
 	case <-time.After(5 * time.Second):
 		t.Fatal("background metadata refresh did not start")
 	}
 
-	// Let the response through only once Close has requested shutdown.
-	go func() {
-		<-concreteClient.closer
-		release()
-	}()
 	require.NoError(t, closeClient())
 
 	select {
