@@ -1398,58 +1398,38 @@ func (w *matchWriter) matched() bool {
 func TestClientAutorefreshShutdownRace(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
 	t.Cleanup(seedBroker.Close)
-	leader := NewMockBroker(t, 2)
-	t.Cleanup(leader.Close)
-	leader.SetHandlerByMap(map[string]MockResponse{
-		"MetadataRequest": NewMockMetadataResponse(t).
-			SetBroker(leader.Addr(), leader.BrokerID()).
-			SetLeader("foo", 0, leader.BrokerID()),
-	})
 
 	metadataResponse := new(MetadataResponse)
 	metadataResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
-	refreshResponse := new(MetadataResponse)
-	refreshResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
-	refreshResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	refreshResponse.AddTopicPartition("foo", 0, leader.BrokerID(), []int32{2}, []int32{2}, []int32{}, ErrNoError)
+	refreshResponse := NewMockMetadataResponse(t).
+		SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+		SetLeader("foo", 0, seedBroker.BrokerID())
 
 	refreshStarted := make(chan struct{})
 	releaseRefresh := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(releaseRefresh) }) }
+	release := sync.OnceFunc(func() { close(releaseRefresh) })
 	t.Cleanup(release)
-	requests := 0
+	var refreshOnce sync.Once
+	initialRequest := true
 	seedBroker.setHandler(func(req *request) encoderWithHeader {
-		requests++
-		if requests == 1 {
+		if initialRequest {
+			initialRequest = false
 			metadataResponse.setVersion(req.body.version())
 			return metadataResponse
 		}
-		if requests == 2 {
-			close(refreshStarted)
-		}
+		refreshOnce.Do(func() { close(refreshStarted) })
 		<-releaseRefresh
-		refreshResponse.setVersion(req.body.version())
-		return refreshResponse
+		return refreshResponse.For(req.body)
 	})
 
 	conf := NewTestConfig()
 	conf.Metadata.RefreshFrequency = time.Millisecond
 	c, err := NewClient([]string{seedBroker.Addr()}, conf)
 	require.NoError(t, err)
-	shutdownStarted := false
-	shutdownDone := make(chan struct{})
+	closeClient := sync.OnceValue(c.Close)
 	t.Cleanup(func() {
 		release()
-		if shutdownStarted {
-			select {
-			case <-shutdownDone:
-			case <-time.After(5 * time.Second):
-				t.Error("client shutdown did not complete during cleanup")
-			}
-		} else {
-			safeClose(t, c)
-		}
+		assert.NoError(t, closeClient())
 	})
 	concreteClient := c.(*client)
 
@@ -1460,31 +1440,17 @@ func TestClientAutorefreshShutdownRace(t *testing.T) {
 		t.Fatal("background metadata refresh did not start")
 	}
 
-	errCh := make(chan error, 1)
-	shutdownStarted = true
+	// Let the response through only once Close has requested shutdown.
 	go func() {
-		defer close(shutdownDone)
-		err := c.Close()
-		select {
-		case <-concreteClient.closed:
-		default:
-			err = errors.New("Close returned before the background metadata updater stopped")
-		}
-		errCh <- err
+		<-concreteClient.closer
+		release()
 	}()
+	require.NoError(t, closeClient())
 
 	select {
-	case <-concreteClient.closer:
-	case <-time.After(5 * time.Second):
-		t.Fatal("client shutdown did not start")
-	}
-	release()
-
-	select {
-	case err := <-errCh:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("client shutdown did not complete")
+	case <-concreteClient.closed:
+	default:
+		t.Fatal("Close returned before the background metadata updater stopped")
 	}
 }
 
