@@ -1397,46 +1397,57 @@ func (w *matchWriter) matched() bool {
 
 func TestClientAutorefreshShutdownRace(t *testing.T) {
 	seedBroker := NewMockBroker(t, 1)
-	defer seedBroker.Close()
+	t.Cleanup(seedBroker.Close)
 
 	metadataResponse := new(MetadataResponse)
 	metadataResponse.AddBroker(seedBroker.Addr(), seedBroker.BrokerID())
-	seedBroker.Returns(metadataResponse)
+	refreshResponse := NewMockMetadataResponse(t).
+		SetBroker(seedBroker.Addr(), seedBroker.BrokerID()).
+		SetLeader("foo", 0, seedBroker.BrokerID())
+
+	refreshClient := make(chan *client)
+	var refreshOnce sync.Once
+	initialRequest := true
+	seedBroker.setHandler(func(req *request) encoderWithHeader {
+		if initialRequest {
+			initialRequest = false
+			metadataResponse.setVersion(req.body.version())
+			return metadataResponse
+		}
+		refreshOnce.Do(func() {
+			if c := <-refreshClient; c != nil {
+				<-c.closer
+			}
+		})
+		return refreshResponse.For(req.body)
+	})
 
 	conf := NewTestConfig()
-	conf.Metadata.RefreshFrequency = 100 * time.Millisecond
-	client, err := NewClient([]string{seedBroker.Addr()}, conf)
-	if err != nil {
-		t.Fatal(err)
+	conf.Metadata.RefreshFrequency = time.Millisecond
+	c, err := NewClient([]string{seedBroker.Addr()}, conf)
+	require.NoError(t, err)
+	closeClient := sync.OnceValue(c.Close)
+	t.Cleanup(func() {
+		close(refreshClient)
+		assert.NoError(t, closeClient())
+	})
+	concreteClient := c.(*client)
+
+	// The send confirms a background request is in flight. Its handler waits
+	// for Close to request shutdown before replying.
+	select {
+	case refreshClient <- concreteClient:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background metadata refresh did not start")
 	}
 
-	// Wait for the background refresh to kick in
-	time.Sleep(110 * time.Millisecond)
+	require.NoError(t, closeClient())
 
-	errCh := make(chan error, 1)
-	go func() {
-		// Close the client
-		errCh <- client.Close()
-		close(errCh)
-	}()
-
-	// Wait for the Close to kick in
-	time.Sleep(10 * time.Millisecond)
-
-	// Then return some metadata to the still-running background thread
-	leader := NewMockBroker(t, 2)
-	defer leader.Close()
-	metadataResponse.AddBroker(leader.Addr(), leader.BrokerID())
-	metadataResponse.AddTopicPartition("foo", 0, leader.BrokerID(), []int32{2}, []int32{2}, []int32{}, ErrNoError)
-	seedBroker.Returns(metadataResponse)
-
-	err = <-errCh
-	if err != nil {
-		t.Fatalf("goroutine client.Close():%s", err)
+	select {
+	case <-concreteClient.closed:
+	default:
+		t.Fatal("Close returned before the background metadata updater stopped")
 	}
-
-	// give the update time to happen so we get a panic if it's still running (which it shouldn't)
-	time.Sleep(10 * time.Millisecond)
 }
 
 func TestClientConnectionRefused(t *testing.T) {
